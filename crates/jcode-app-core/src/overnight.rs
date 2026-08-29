@@ -257,6 +257,12 @@ async fn run_supervisor(
         registry.register_selfdev_tools().await;
     }
 
+    // Captured before `child` moves into Agent::new_with_session below —
+    // needed for the Mission Engine supervisor gate (Fusion Phase 0, fourth
+    // slice). Opt-in: sessions with no mission set are entirely unaffected,
+    // see crate::mission::supervisor_gate's doc comment.
+    let mission_session_id = child.id.clone();
+
     let mut agent = Agent::new_with_session(provider, registry, child, None);
     let mut next_prompt = build_coordinator_prompt(&manifest, &preflight);
     let mut handoff_notice_sent = false;
@@ -279,6 +285,32 @@ async fn run_supervisor(
                 "Cancelled before next turn",
             )?;
             break;
+        }
+
+        match crate::mission::supervisor_gate(&mission_session_id).await {
+            Ok(Some(stop_reason)) => {
+                record_event(
+                    &current,
+                    "mission_supervisor_gate_stop",
+                    stop_reason.clone(),
+                    json!({}),
+                    true,
+                )?;
+                mark_completed(&current, OvernightRunStatus::Completed, &stop_reason)?;
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // Fail open: a broken mission check must not take down an
+                // otherwise-healthy overnight run. Log and keep going,
+                // mirroring the pre_tool hook's own fail-open policy
+                // (jcode-base/src/hooks.rs) rather than inventing a new
+                // failure convention.
+                crate::logging::warn(&format!(
+                    "[mission] supervisor_gate check failed for session {mission_session_id}, \
+                     continuing without it: {err}"
+                ));
+            }
         }
 
         let now = Utc::now();

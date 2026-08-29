@@ -333,6 +333,77 @@ fn any_provider_hard_limited(reports: &[crate::usage::ProviderUsage]) -> bool {
     reports.iter().any(|report| report.hard_limit_reached)
 }
 
+/// Fusion Phase 0, fourth slice: the outer supervisor gate.
+///
+/// This is what actually ties budget enforcement + completion verification +
+/// the continuation-reminder mechanism together into something that can run
+/// unattended — the piece DESIGN.md describes as "a driver loop modeled on
+/// `overnight.rs::run_supervisor`". Rather than duplicating `run_supervisor`'s
+/// substantial `Agent`/`Session`/`Provider` construction machinery in a
+/// parallel implementation, this is designed to be called **from inside**
+/// `run_supervisor`'s existing loop, once per turn — see the call site added
+/// to `overnight.rs`.
+///
+/// Returns `Ok(Some(reason))` if the caller should stop the supervisor loop
+/// because of the mission's state (budget exhausted, or completion verified);
+/// `Ok(None)` if the loop should keep going. A session with no mission at all
+/// always returns `Ok(None)` — Mission Engine is opt-in, not a behavior
+/// change for Overnight runs that don't use it.
+///
+/// Note on completion: a *refuted* claim does **not** stop the loop — the
+/// mission stays `Active` with the claim still pending, and the agent is
+/// expected to keep working and can re-claim later. Only a *confirmed*
+/// claim stops it.
+pub async fn supervisor_gate(session_id: &str) -> Result<Option<String>> {
+    let Some(mission) = load(session_id)? else {
+        return Ok(None);
+    };
+
+    if mission.status == MissionStatus::BudgetLimited {
+        return Ok(Some(
+            "mission is budget_limited: a connected provider was already hard-limited"
+                .to_string(),
+        ));
+    }
+
+    if mission.status != MissionStatus::Active {
+        // Paused/Blocked/NeedsDecision/Abandoned/Complete: not this
+        // function's job to decide whether that should stop the loop —
+        // Complete in particular is already a natural stop condition the
+        // caller can check via `mission.status` directly without going
+        // through this gate at all.
+        return Ok(None);
+    }
+
+    if let Some(updated) = enforce_budget(session_id).await? {
+        if updated.status == MissionStatus::BudgetLimited {
+            return Ok(Some(
+                "mission transitioned to budget_limited: a connected provider is hard-limited"
+                    .to_string(),
+            ));
+        }
+    }
+
+    if mission.pending_completion_claim.is_some() {
+        match verify_completion(session_id)? {
+            VerificationOutcome::Confirmed { .. } => {
+                return Ok(Some(
+                    "mission completion claim verified — objective achieved".to_string(),
+                ));
+            }
+            VerificationOutcome::Refuted { reason } => {
+                crate::logging::info(&format!(
+                    "[mission] completion claim for session {session_id} refuted, \
+                     continuing: {reason}"
+                ));
+            }
+            VerificationOutcome::NoPendingClaim => {}
+        }
+    }
+
+    Ok(None)
+}
+
 pub fn clear(session_id: &str) -> Result<bool> {
     let path = mission_path(session_id)?;
     if path.exists() {
@@ -574,6 +645,124 @@ mod completion_verification_tests {
             let outcome = verify_completion(session_id).expect("verify");
             assert_eq!(outcome, VerificationOutcome::NoPendingClaim);
         });
+    }
+}
+
+#[cfg(test)]
+mod supervisor_gate_tests {
+    use super::*;
+
+    // Each test below sets up its own isolated JCODE_HOME inline rather than
+    // via a shared sync helper, since these are #[tokio::test] async fns and
+    // a synchronous FnOnce-based helper (as used elsewhere in this file for
+    // non-async tests) doesn't fit cleanly here.
+
+    #[tokio::test]
+    async fn no_mission_never_stops_the_loop() {
+        // Isolated JCODE_HOME with no mission ever set for this session id.
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        let outcome = supervisor_gate("ses_never_existed").await.expect("gate");
+        assert_eq!(outcome, None);
+    }
+
+    #[tokio::test]
+    async fn active_mission_with_no_budget_issue_and_no_claim_continues() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        let session_id = "ses_gate_normal";
+        set(session_id, "Ship the supervisor gate").expect("set mission");
+
+        // No credentials configured in this isolated home, so
+        // fetch_all_provider_usage() returns an empty Vec without touching
+        // the network -- this really does exercise enforce_budget's async
+        // path, not skip it.
+        let outcome = supervisor_gate(session_id).await.expect("gate");
+        assert_eq!(outcome, None);
+        let mission = load(session_id).expect("load").expect("exists");
+        assert_eq!(mission.status, MissionStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn already_budget_limited_stops_immediately_without_reenforcing() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        let session_id = "ses_gate_already_limited";
+        set(session_id, "Ship the supervisor gate").expect("set mission");
+        // Force into BudgetLimited directly via the persistence layer (not
+        // through update_status, which only forbids reaching Complete —
+        // BudgetLimited is a legitimate direct transition).
+        update_status(session_id, MissionStatus::BudgetLimited).expect("force budget_limited");
+
+        let outcome = supervisor_gate(session_id).await.expect("gate");
+        match outcome {
+            Some(reason) => assert!(reason.contains("budget_limited")),
+            None => panic!("expected the gate to stop the loop"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_active_non_budget_status_passes_through_without_checking_claim() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        let session_id = "ses_gate_paused";
+        set(session_id, "Ship the supervisor gate").expect("set mission");
+        update_status(session_id, MissionStatus::Paused).expect("pause");
+
+        let outcome = supervisor_gate(session_id).await.expect("gate");
+        assert_eq!(outcome, None);
+    }
+
+    #[tokio::test]
+    async fn confirmed_completion_claim_stops_the_loop() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        let session_id = "ses_gate_confirmed";
+        set(session_id, "Ship the supervisor gate").expect("set mission");
+        set_success_criteria(session_id, vec!["Gate stops on confirmed completion".to_string()])
+            .expect("set criteria");
+        claim_complete(
+            session_id,
+            vec!["Wrote and ran supervisor_gate_tests, all passing".to_string()],
+        )
+        .expect("claim");
+
+        let outcome = supervisor_gate(session_id).await.expect("gate");
+        match outcome {
+            Some(reason) => assert!(reason.to_lowercase().contains("verified")),
+            None => panic!("expected the gate to stop the loop on confirmed completion"),
+        }
+        let mission = load(session_id).expect("load").expect("exists");
+        assert_eq!(mission.status, MissionStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn refuted_completion_claim_does_not_stop_the_loop() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        let session_id = "ses_gate_refuted";
+        set(session_id, "Ship the supervisor gate").expect("set mission");
+        // No success criteria set -> verify_completion will refute.
+        claim_complete(
+            session_id,
+            vec!["Wrote and ran supervisor_gate_tests, all passing".to_string()],
+        )
+        .expect("claim");
+
+        let outcome = supervisor_gate(session_id).await.expect("gate");
+        assert_eq!(outcome, None, "a refuted claim must not stop the loop");
+        let mission = load(session_id).expect("load").expect("exists");
+        assert_eq!(mission.status, MissionStatus::Active);
+        assert!(
+            mission.pending_completion_claim.is_some(),
+            "refuted claim should stay pending, not be dropped"
+        );
     }
 }
 
