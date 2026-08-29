@@ -1,0 +1,165 @@
+# jcode-fusion: Progress Tracker
+
+**Read this file first at the start of every session.** It's the source of truth for what's done, what's in progress, and what's next — DESIGN.md has the *what/why*, this file has the *where we are*.
+
+---
+
+## Setup decisions (locked in 2026-08-29)
+
+- **Project name: Fusion.** Considered Alloy/Crucible/Waypoint as alternatives; kept "Fusion" (shortened from the working label `jcode-fusion`) since it required zero rebranding — already the binary name, folder name, and terminology used throughout this file and DESIGN.md.
+- **Base**: jcode, pinned to `v0.81.2` (matches all research in DESIGN.md — not tracking upstream `main`, to avoid the base shifting mid-build).
+- **Fork location**: `Desktop/ClaudeCode/jcode-fusion/jcode/` — a fresh clone, kept fully separate from the user's real working jcode install at `~/.local/bin/jcode` / `~/.jcode/`. **Never touch those paths.**
+- **Binary/package name**: root `[[bin]] name` renamed `jcode` → `jcode-fusion` in `Cargo.toml` (package name left as `jcode` internally — low risk, doesn't land on PATH). Other bin targets (`test_api`, `jcode-harness`, benches) left as-is for now, not installed to PATH by normal use.
+- **Hosting**: pushed to GitHub as of 2026-08-29 — `github.com/tirthfx/jcode-fusion` (private). Local checkout's remotes: `origin` = the new fork repo, `upstream` = the real `1jehuang/jcode` (renamed from the default `origin` the clone came with). Working branch is `main`, created from the `v0.81.2` tag checkout (which was in detached HEAD).
+- **Sandboxing sequencing**: macOS (Seatbelt) first, since dev machine is macOS. Linux (bwrap) comes later, validated via Docker/CI rather than bare-metal (this machine can't run bwrap natively).
+- **License note**: jcode is MIT. Reimplement patterns from Codex/Grok Build in idiomatic jcode-style Rust — don't copy-paste Apache-2.0 source (see DESIGN.md §6 license note).
+
+## Phase status
+
+| Phase | Contents | Status |
+|---|---|---|
+| **0 — Foundation** | Unified Mission Engine (#1), provable-safe rewind (#4) | **In progress** — first slice underway (see session log) |
+| **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | Not started |
+| **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | Not started |
+| **3 — Ecosystem** | ACP support (#7), orchestration-as-script (#8) | Not started |
+| **4 — Memory** | Two-phase consolidation (#9) | Not started |
+
+Item **#0 (multi-provider OAuth)** is jcode's existing feature — kept as-is, never modified.
+
+## Session log
+
+### 2026-08-29 — Setup
+- Design doc finalized (`DESIGN.md`): base-harness decision, swarm resolution, size estimates (source-size-based and real on-disk footprint from GitHub release assets).
+- Diagnosed user's existing local jcode install: `~/.jcode` was 7.9GB, almost entirely a stale Self-Dev scratch checkout (`scratch/jcode-fix-688/`, 5.5GB — mostly an abandoned `target/` build cache) plus 276MB of retained old binary versions. Not a property of jcode's real footprint — flagged as a build-cache-hygiene gap worth avoiding in the fused harness (see DESIGN.md open risks). User asked to delete it; that's a manual step for them (file deletion is outside what I do directly) — command given in chat.
+- Cloned `1jehuang/jcode` fresh, pinned to `v0.81.2`, into `jcode-fusion/jcode/` (558MB on disk incl. `.git`). Confirmed `git describe --tags` = `v0.81.2` exactly.
+- Renamed root `[[bin]] name` from `jcode` → `jcode-fusion` in `Cargo.toml` to prevent any collision with the user's real install at `~/.local/bin/jcode`.
+- Ran `cargo build --bin jcode-fusion` (plain cargo, not the repo's `scripts/dev_cargo.sh` wrapper — that script pulls in remote-config loading and its own telemetry/action-logging, more than wanted for a first sanity build). **Succeeded** (exit 0). Verified: `target/debug/jcode-fusion` exists (338MB, unstripped debug Mach-O arm64 binary), runs, and prints `jcode v0.81.2-dev (3453b8b61, dirty)`.
+  - Note: the version string still says `jcode`, not `jcode-fusion` — it's derived from the package name / a build script, not the `[[bin]] name`. Cosmetic, not urgent; fix later if it matters.
+  - "dirty" in the version string is expected — it's reflecting our intentional `Cargo.toml` bin-rename edit, not a problem.
+  - `target/` is already 4.8GB after just this one debug build of the workspace. This is **normal for a from-scratch debug build of a ~90-crate workspace**, not a repeat of the earlier scratch-checkout bug — but it's exactly the kind of directory that shouldn't be forgotten. `rm -rf target/` (or `cargo clean`) is always safe here — unlike the git checkout, it's pure build cache, nothing of value in it.
+
+## Source-level findings (2026-08-29, real code read — supersedes doc-based assumptions in DESIGN.md §4.1/§5.2)
+
+**Big one: jcode already has a `Goal`/`GoalStatus` data model.** `crates/jcode-task-types/src/lib.rs` defines `Goal` (id, title, scope, status, description, success_criteria, milestones, progress_percent, updates) and `GoalStatus` (`Draft/Active/Paused/Blocked/Completed/Archived/Abandoned`), with a full CRUD layer in `crates/jcode-base/src/goal.rs` and an agent tool at `crates/jcode-app-core/src/tool/goal.rs`. **This means Phase 0 is not "build a new Goal Engine from scratch" — it's "extend this existing model with the two things it's missing":**
+- **No automatic budget enforcement.** `progress_percent`/`success_criteria` are free-text the model sets itself; nothing tracks tokens/cost/turns or halts a run on a budget.
+- **No automatic completion verification.** Nothing checks whether a goal is *actually* done before marking it complete — this is exactly where Grok Build's adversarial-verifier idea (DESIGN.md item #1) plugs in.
+
+**The Overnight subsystem (`crates/jcode-app-core/src/overnight.rs`, `run_supervisor`) is the closest existing analog to a Goal Engine driver loop, and gives us the architecture pattern to copy**: it drives the agent from *outside* the turn loop (`agent.run_once_capture(prompt)` in an outer `loop{}`), deciding continue/stop externally and injecting a new prompt each iteration — rather than modifying `run_turn` itself. **A Goal Engine should be built the same way**: a new outer supervisor (modeled on `run_supervisor`) that wraps the existing `Goal` struct instead of `OvernightManifest`, adds real budget enforcement (missing today — Overnight only has an advisory one-shot usage *projection*, `build_usage_projection`, that never halts anything) and real completion verification (missing today — Overnight only asks the model to self-report via unverified task-card JSON).
+
+**Rewind: a `/rewind` feature already exists** (`Agent::rewind_to_message`/`undo_rewind`, `turn_execution.rs`) but has real, specific gaps vs. "provable-safe":
+- `rewind_undo_snapshot` is **in-memory only** on `Agent` — never persisted, doesn't survive a restart, and only holds **one** snapshot (a second rewind overwrites the first, no stack).
+- Message-only — no filesystem/tool-side-effect awareness.
+- Good news: **compaction never actually destroys raw messages** (`CompactionManager` only tracks a `compacted_count` cursor over an immutable slice) — so "reconstruct pre-compaction state" is mostly already possible from data that's already there, not a from-scratch problem.
+- Reusable primitives: `Session::rewind_target_stored_indices()`, `truncate_messages`, `replace_messages` (`jcode-base/src/session.rs`).
+
+**Any turn-loop-level change must account for two parallel implementations that need to stay in sync**: `turn_loops.rs::run_turn` (blocking/CLI) and `turn_streaming_mpsc.rs::run_turn_streaming_mpsc` (TUI/production path) — same control flow, duplicated. The existing `tool_calls.is_empty()` branch (`turn_loops.rs:831-877`) with its `maybe_continue_*` pattern is the natural hook point if a change needs to happen *inside* a turn rather than wrapping it Overnight-style from outside.
+
+**Ambient/Self-Dev deep-dive landed — major revision below, read before doing anything else.**
+
+### Critical correction: rename "Goal Engine" → "Mission Engine" (naming collision found)
+
+jcode already ships an **unrelated, actively-used feature also called `Goal`** — `crates/jcode-task-types`, `jcode-base/src/goal.rs`, exposed as the `"initiative"` agent tool (`create|list|show|resume|update|checkpoint|focus`), persisted at `~/.jcode/goals/`, with its own side-panel UI and a `TelemetryToolCategory::Goal` mapping. **This is a durable, manual, cross-session task/milestone tracker — not an autonomous loop, and not what we want to build.** Calling our consolidation project "Goal Engine" would directly collide with this shipped feature's vocabulary. **Renaming our concept to "Mission Engine" from here on** — which turns out to fit perfectly, because:
+
+**We found the real foundation to build on: `crates/jcode-app-core/src/mission.rs` — dead code, but already shaped almost exactly right.** `Mission { session_id, objective, long_horizon_intent, status: MissionStatus, success_criteria, validation_plan, checkpoints, ... }` with `MissionStatus { Active, Paused, Blocked, NeedsDecision, BudgetLimited, Complete, Abandoned }` — **`BudgetLimited` already exists as a first-class state**, closer to Codex's `ThreadGoal` state machine than anything else in the codebase. But `mission::set()` (the only write path) has **zero callers anywhere** — only the read side is wired (`mission::active_system_reminder`, called from 3 sites in `crates/jcode-tui/src/tui/app/input.rs` to inject a reminder into turns). **Someone already half-designed this and never finished it.** Our Phase 0 work is finishing that wiring, not designing from scratch.
+
+### Revised understanding of the three "fragmented" subsystems
+
+- **Ambient Mode is NOT a state machine to unify — it's a plain polling loop.** "Gardening/scouting/working" is prompt text (`ambient/prompt.rs`), not code — there's no `enum CyclePhase`. Its only real state is `AmbientStatus { Idle, Running, Scheduled, Paused, Disabled }`. **Also found: its "adaptive, usage-aware scheduling" is dead code in production** — `AdaptiveScheduler::calculate_interval` has real projection math, but both real call sites always pass `None` for usage data, collapsing it to a fixed interval + exponential backoff. `UsageLog::record()` (the only way to populate real usage data) is never called outside its own unit tests.
+- **Overnight Mode is the most mature and closest existing template** — one long-lived `Agent` across an entire run, wall-clock-milestone-driven prompt switching, and (unlike Ambient) **real working budget wiring**: `crate::usage::fetch_all_provider_usage()` → `ProviderUsage` is an actually-functioning cross-provider usage source, computed at preflight. **Mission Engine's budget tracking should build on this (`crate::usage`), not on Ambient's dead `UsageLog`/`AdaptiveScheduler`.**
+- **Self-Dev Mode is arguably a different category of thing entirely, not a task-completion loop** — it's a build/reload pipeline (`BuildRequestState`, `ReloadPhase`), genuinely separate machinery with no shared code with Ambient or Overnight. **Open question to resolve before Phase 2**: does Self-Dev actually belong in this consolidation at all, or does "Mission Engine" only unify Ambient + Overnight (+ revived Mission), leaving Self-Dev as its own separate subsystem? Leaning toward the latter — forcing a build-pipeline state machine into a task-completion-loop abstraction may not be a real win.
+
+### Revised Phase 0 plan
+
+Not "design a new state machine" — it's: **(1)** finish wiring `Mission`'s write path (give `mission::set()` real callers), **(2)** add budget enforcement sourced from `crate::usage::fetch_all_provider_usage()` (Overnight's pattern, not Ambient's dead one) that actually halts a run on `BudgetLimited`, **(3)** add completion verification (Grok Build's adversarial-verifier idea) that gates `Complete`, **(4)** build the outer driver loop modeled on `overnight.rs::run_supervisor` (drive `agent.run_once_capture()` from outside, don't touch `run_turn`/`run_turn_streaming_mpsc` internals). Ambient Mode's dead adaptive-scheduler bug is a pre-existing jcode issue, not ours to fix unless it's in our way.
+
+## Phase 1 source-level findings (2026-08-29 — real code read, done before Phase 1 starts per the review pass)
+
+**`pre_tool` hook checks out exactly as docs described** — `GateDecision::Allow/Block` (`jcode-base/src/hooks.rs`), genuinely synchronous (`tokio::time::timeout` around child-process wait), fail-open on anything but exit code 2. Call site: `Registry::execute` (`tool/mod.rs:672`), before `tool.execute()` runs. No correction needed here — safe to build on directly.
+
+**Two real gaps that change the Guardian/sandboxing design:**
+
+1. **There is no general "allow this command?" TUI prompt for risky tool calls in normal interactive sessions — this assumption from the original web research was wrong.** The only approval-request system that exists (`SafetySystem`/`request_permission`, `jcode-base/src/safety.rs`) is **restricted to ambient/autonomous sessions only** (`ensure_ambient_session` check) — normal interactive sessions can't even call it. Worse: `PermissionRequest.wait: bool` (meant to mean "block until user decides") **is a no-op** — never read anywhere except where it's written. `request_permission` always returns `Queued` immediately and non-blocking; the only thing that ever resolves a queued request is a debug-socket command handler (`ambient:approve:<id>`/`ambient:deny:<id>`), not any TUI dialog. **A Guardian auto-approver plugs in by adding an automated path that answers these requests instead of/before the debug-socket human path** — but note it only covers ambient-session calls, not regular interactive bash tool calls (those go through a completely different, already-sophisticated system — see #2).
+
+2. **jcode already has a much more sophisticated command-risk classifier than "execpolicy as Starlark" assumed it'd be adding on top of nothing.** `crates/jcode-command-risk` does blast-radius classification (`RiskLevel::{Safe,Low,Confirm,Catastrophic}`) — deliberately avoiding simple allow/deny lists in favor of tokenizing commands, unwrapping `sudo`/`env`/`xargs` wrappers, and checking redirect targets against protected paths. It already has a "Reflect" mechanic: a `Confirm`-tier command forces the model to resubmit with a substantive `justification` field (min 25 chars, rejects bare "yes/ok") rather than prompting a human. This is wired directly into `BashTool::execute` via `bash_destructive_gate.rs`, before any subprocess spawns. **Open design decision, not yet resolved**: does execpolicy-as-Starlark replace this crate wholesale, layer on top of it, or just migrate its rule tables (`DESTRUCTIVE_COMMANDS`, `CONDITIONALLY_DESTRUCTIVE`, protected-path logic) into Starlark form? Building both side-by-side would mean two overlapping deterministic gates on the same `bash` call — needs a decision before Phase 1 starts, not during it.
+
+**A third finding that's a hard architectural gap for sandboxing specifically, not just a "needs a decision" item**: **file-edit tools never spawn a subprocess at all.** `WriteTool::execute` calls `tokio::fs::write(...)` directly, in-process. A sandbox built by wrapping the bash-tool's subprocess spawn point (`build_shell_command`, `bash.rs:657` — note there are **two** separate spawn sites here, foreground/background *and* a third detached/reload path, `build_detached_shell_wrapper`, that also needs wrapping) would **silently miss file writes/edits entirely**. Real options: (a) sandbox the whole jcode process, not just shell-outs, or (b) re-route file-edit tools through a sandboxed helper process. This needs to be decided before Phase 1 sandboxing work starts — it changes the shape of the whole feature, not an implementation detail.
+
+**Confirmed no existing sandboxing scaffolding at all** (`grep -rniI "sandbox-exec|seatbelt|bubblewrap|landlock|seccomp|bwrap"` — zero matches) — that part of the original assumption was correct, nothing to duplicate there.
+
+## Phase 3/4 source-level findings (2026-08-29 — real code read)
+
+**Big correction: jcode's ACP adapter is NOT a stub — it's a real, actively-maintained JSON-RPC server** (`src/cli/acp.rs`, 2,188 lines). Implements `initialize`, `session/new`, `session/load`/`resume` (with history replay), `session/prompt` (with streaming `session/update` notifications), `session/cancel`/`close`, config options, and even a jcode-specific extension mechanism. Confirmed via changelog cross-check — this has shipped multiple real feature releases, not abandoned scaffolding. **This flips Phase 3/item #7 from "extend a partial adapter to full coverage" to "close specific, identified gaps"**:
+- Never sends client-side callback methods (`fs/read_text_file`, `fs/write_text_file`, `session/request_permission`, `terminal/*`) — does all file I/O and permission handling server-side, never delegates to the ACP host, which real hosts (Zed etc.) generally expect for editor-integrated UX.
+- No auth negotiation via ACP itself (`authMethods` hardcoded empty).
+- Session-scoped MCP servers explicitly rejected ("not supported yet").
+- `initialize` ignores the client's requested protocol version, always pins to jcode's own v1.
+
+**`VersionedPlan` is already durably persisted — not "ephemeral server-memory state" as assumed.** `crates/jcode-app-core/src/server/swarm_persistence.rs` is a mature persistence layer: atomic writes with backup rotation, CAS-style version checks, tombstone deletion, dormant-plan GC (7-day default) — written on ~27 call sites across nearly every plan mutation. **Orchestration-as-script (#8) doesn't need to build persistence from scratch** — it extends this existing layer with a new capability: turning a `VersionedPlan` into a reusable, parameterized, replayable template (which doesn't exist today in any form).
+
+**Zero embedded-scripting dependency exists today** (`rhai`/`starlark`/`mlua`/`wasmtime` — no hits in `Cargo.toml` or `Cargo.lock`, direct or transitive). Both execpolicy-as-Starlark (#6) and workflow-as-script (#8) are genuinely greenfield dependency additions.
+
+**Memory consolidation: docs are accurate here (rare case where they weren't stale).** `docs/MEMORY_ARCHITECTURE.md`'s "Phase 8: Ambient Garden" checklist is explicitly unimplemented, every item unchecked, confirmed by real code inspection. Only one sliver is wired: embedding backfill runs fire-and-forget after each ambient cycle (`ambient/runner.rs:774`). Real APIs to build on: `MemoryManager` (`jcode-base/src/memory.rs`) and `MemoryGraph` (`jcode-memory-types/src/graph.rs`, has `cascade_retrieve` already).
+
+**Important cross-cutting finding, affects Phase 3 AND Phase 4 AND ties back to Phase 0: there is no generic background-job scheduler in jcode at all.** The only periodic-loop primitive that exists is Ambient Mode's own purpose-built runner, tightly coupled to spawning a full LLM agent session. **This means Mission Engine's supervisor loop (Phase 0, modeled on `overnight.rs::run_supervisor`) is a candidate to become the shared scheduling primitive Phases 3–4 also need**, rather than each phase inventing its own ad hoc scheduling — worth deciding explicitly rather than defaulting to 3 separate bespoke schedulers.
+
+## Phase 2 source-level findings (2026-08-29 — real code read)
+
+**Issue #1090 is already fixed** — commit `0a66fbcd2` ("fix: preserve live headless workers during idle checks"), an ancestor of our `v0.81.2` checkout. DESIGN.md cited this as Phase 2's justification; that premise is now stale/wrong and has been dropped from DESIGN.md. Worktree isolation is still worth doing, just purely on conflict-resolution merits, not this bug.
+
+**`VersionedPlan` confirmed already persisted to disk** (`server/swarm_persistence.rs`) — this independently confirms what the Phase 3/4 agent found too. Good cross-validation.
+
+**Zero worktree isolation exists today** — workers share the parent's working dir outright by default; no `git2`/`gix` dependency, no `git worktree add` call anywhere in the codebase. Reusable scaffolding found: `git_common_dir_for()`/`swarm_id_for_dir()` already detect worktree `.git` layouts and derive a shared swarm id from the common `.git` dir — worth building on rather than duplicating.
+
+**Two smaller corrections**: the TUI's "worktree manager" role is aspirational comment text with zero backing implementation (no such role exists in the actual role-ranking code) — don't assume it as prior art. And "one-level fan-out" is actually a root/deep-mode boolean gate, not a depth counter — deep-swarm mode has no depth limit today at all (only a 1000-member cap + concurrency budget). File-touch conflict detection is confirmed exactly as docs describe: pure post-hoc notification, no locking.
+
+## Full review pass complete (2026-08-29) — all 5 phases now source-verified
+
+Every item in DESIGN.md §6 has been checked against jcode's real `v0.81.2` source, not just docs/web research. DESIGN.md has been updated throughout to reflect this (executive summary, autonomy table, full feature table, phased roadmap, size estimates, open risks). Summary of what changed per phase is in each phase's "source-level findings" section above and in DESIGN.md §6 directly.
+
+**Real open decisions surfaced that need a call before their phase starts** (not mechanical corrections — genuine forks in approach):
+1. **Guardian's scope** (Phase 1, item #3): only auto-answer ambient-session permission requests (narrower, matches what exists today), or also build a new general-session review path (broader, more work, nothing to build on)?
+2. **Execpolicy vs. `jcode-command-risk`** (Phase 1, items #3/#6): jcode already has a real deterministic command-risk classifier wired into `BashTool`. Does Starlark-based execpolicy replace it, layer on top, or absorb its rule tables?
+3. **File-edit-tool sandboxing gap** (Phase 1, item #5): file tools never spawn a subprocess, so a bash-subprocess-wrapping sandbox would miss them entirely. Sandbox the whole process, or route file tools through a sandboxed helper?
+4. **Shared scheduler question** (cuts across #1/#8/#9): should Mission Engine's supervisor loop become the one shared "run this periodically in the background" primitive for orchestration-as-script and memory consolidation too, instead of 3 separate ad hoc schedulers?
+
+None of these block Phase 0 (the first slice — finishing `Mission`'s write path — doesn't touch any of them), so they don't need answers today, but they do need answers before Phase 1/3/4 actually start.
+
+## Phase 0 first slice: DONE (2026-08-29) — `Mission`'s write path now has real callers
+
+Built a `mission` agent tool (`crates/jcode-app-core/src/tool/mission.rs`, registered in `tool/mod.rs` as `mission`, alongside `initiative`/`memory`/`todo` in the base tool set — available in every session, not gated to ambient-only). Actions: `set` (declare/reactivate objective), `show`, `status` (validated against a new `MissionStatus::parse`, added to `mission.rs`), `checkpoint`, `clear`. This is the first genuinely new code written for Fusion — everything before this was research/planning/setup.
+
+- **Verified, not just written**: `cargo check -p jcode-app-core` clean (2 pre-existing unrelated warnings only), and a new test (`tool/mission_tests.rs`, `mission_tool_full_round_trip`) passes — covers the full lifecycle (empty → set → reminder-injected-while-active → show → checkpoint → status-to-blocked → reminder-stops-once-not-active → invalid-status-rejected → clear → operations-on-cleared-mission-fail-cleanly).
+- **Deliberately did NOT do** in this slice (by design, per the "smallest coherent first slice" plan): no budget enforcement, no completion verification, no outer supervisor loop, no change to `set()`'s signature (doesn't yet accept `success_criteria`/`validation_plan` — the existing functions were wired up as-is, not extended).
+- **Confirmed real-world effect**: `crate::mission::active_system_reminder()` (the pre-existing read path, wired into the TUI's turn-reminder injection) now actually has something to read, since a session can genuinely have an active mission for the first time.
+
+## Phase 0 first slice: manually verified end-to-end (2026-08-29)
+
+Ran the actual production code path live (not the automated test) via a new example, `crates/jcode-app-core/examples/mission_tool_demo.rs` (`cargo run --example mission_tool_demo -p jcode-app-core`) — drives the real `MissionTool` through the full lifecycle against an isolated `JCODE_HOME`, no mocks. All steps behaved correctly: reminder absent → set → reminder present → checkpoint → status→blocked → reminder absent again → invalid status rejected → clear → post-clear operations fail cleanly.
+
+Also tried the real `jcode-fusion run` headless one-shot command against an isolated data dir (never touched the user's real `~/.jcode`) — confirmed it correctly refuses without configured provider credentials ("No credentials configured for provider auto-detection"), which is expected and correct; a full live-LLM/TUI verification would need the user's own login, done in their own terminal, not something to fake here.
+
+**Real finding worth recording**: `MISSION_CONTINUATION_TEMPLATE` (`crates/jcode-base/src/prompt/mission_continuation.md`, injected while a mission is `Active`) already contains detailed self-audit instructions — "treat completion as unproven," "treat uncertain/stale/missing evidence as not achieved," explicit verification-discipline guidance. **This is real prior art for the completion-verification idea (Grok Build's `/goal`)** — it's prompt-level self-auditing, not code-enforced independent verification, so the actual gap (nothing *blocks* a status transition to `Complete` if the model ignores this guidance) still stands and is still worth building. But the prompt scaffolding to build on top of is more mature than assumed — worth having the eventual verifier reuse/reference this template's own audit criteria rather than inventing separate ones.
+
+## Phase 0 second slice: budget enforcement — DONE (2026-08-29)
+
+Added `mission::enforce_budget(session_id)` — checks real provider usage via `crate::usage::fetch_all_provider_usage()` (the same actually-working source Overnight uses, not Ambient's dead one, per the earlier findings) and transitions a mission to `BudgetLimited` if any connected provider is genuinely hard-limited. Decision logic split into a pure `any_provider_hard_limited()` function so it's unit-testable without network/credentials — 3 new tests, all passing. Exposed as a new `check_budget` action on the `mission` tool.
+
+**Documented, deliberate scope limit**: checks *any* connected provider's hard-limit status, not specifically the provider the current session is using (mission.rs is provider-agnostic and doesn't have a session→active-provider lookup available to it yet). Flagged in code comments as a known simplification to refine later, not silently shipped as if it were fully correct.
+
+**Test gap, also documented**: the `check_budget` tool action's end-to-end path (through real `fetch_all_provider_usage()`) isn't covered by an automated test, same constraint as the live-TUI verification — it needs real network/credentials. The pure decision logic underneath it is fully tested; the thin async glue on top isn't.
+
+## Repo pushed to GitHub (2026-08-29)
+
+`github.com/tirthfx/jcode-fusion` (private). Committed both Phase 0 slices as one commit on a new `main` branch (the clone was in detached HEAD from the tag checkout). Remotes: `origin` = the new fork, `upstream` = real `1jehuang/jcode`.
+
+## Next steps (pick up here)
+
+1. **Phase 0 first two slices are done, tested, and pushed — this is a good point to build/manually verify in the actual TUI** before continuing (run `jcode-fusion`, use the new `mission` tool from within a real session, confirm the reminder shows up in the next turn) — automated tests pass but haven't been eyeballed end-to-end yet.
+2. **Next real Phase 0 work**: budget enforcement sourced from `crate::usage::fetch_all_provider_usage()`, wired so a mission can actually transition to `BudgetLimited` rather than that just being a status nothing sets.
+3. Then: completion verification (the Grok Build adversarial-verifier idea) gating a transition to `Complete`.
+4. Then: the outer driver loop modeled on `overnight.rs::run_supervisor`, tying budget + verification + the mission's own continuation-reminder mechanism together into something that actually runs unattended.
+5. The 4 open decisions from before (Guardian scope, execpolicy vs. `jcode-command-risk`, file-edit sandboxing gap, shared scheduler) still don't block any of the above — surface them again right before Phase 1/3/4 actually start.
+6. Update this file at the end of every session — status table, session log entry, next steps — before ending.
+
+## Housekeeping reminder
+`jcode-fusion/jcode/target/` is already 4.8GB after one debug build — same kind of build-cache directory that ballooned to 4.9GB in the user's real `~/.jcode/scratch/`. It's safe to `rm -rf target/` any time disk gets tight; nothing of value lives there. Keep an eye on it periodically so this fork doesn't silently repeat that problem long-term.
