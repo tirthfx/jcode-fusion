@@ -258,6 +258,18 @@ Closed the last piece of Phase 2: applying a worker's Fusion-managed worktree br
 
 **This completes Phase 2 in full** (worktree-per-subagent isolation: creation, cleanup, merge-back).
 
+## Merge-back: post-ship review fix (2026-08-30, same session, via agy)
+
+Delegated a code review of the merge-back slice to `agy` (Gemini 3.1 Pro) — full `swarm_worktree.rs` plus the commit diff as context, asked to check correctness, shell-injection risk, merge/conflict/abort edge cases, and simplification opportunities. Every finding was verified against the actual code before acting on it, not taken on faith.
+
+**One real high-severity bug, fixed**: the conflict/abort path checked only `Err(e)` from spawning `git merge --abort`, never its exit status — if abort itself failed (e.g. a held index lock), the function still returned `MergeOutcome::Conflict` as if the repo had been cleanly reverted, while it could actually still be sitting mid-merge. Fixed by checking `MERGE_HEAD` to know whether a merge was genuinely in progress (closes a related edge case the same fix surfaced: a *coordinator*-side dirty tree makes git refuse before `MERGE_HEAD` ever exists, so unconditionally calling abort there would itself fail with a confusing "no merge to abort") and by checking the abort call's real exit status, bailing loudly instead of silently reporting false safety.
+
+**Two low-severity items, also fixed**: conflict-file paths with spaces were reported with literal quote characters from `git status --porcelain`'s quoting — now trimmed. `is_managed_worktree_path` now requires *both* the managed root and the candidate path to actually canonicalize (previously fell back to an uncanonicalized path on either side), closing an edge case where a crafted, nonexistent `.../worktrees/x/../../secrets`-shaped path could pass a component-wise prefix check — real exploitability was negligible since `working_dir` is never populated from arbitrary strings in practice, but the fix was free.
+
+**Confirmed clean, not changed**: the shell-injection question — all `git` calls go through `tokio::process::Command` with separate `.arg()`s, never a shell, so no injection surface regardless of what a branch name or path contains.
+
+New regression test (`merge_worktree_branch_reports_a_dirty_coordinator_tree_cleanly`) covers the coordinator-side-dirty edge case directly. `swarm_worktree.rs`: 20/20 (was 19). Full suite: 1232 passed, 29 failed — same standing baseline, zero regressions.
+
 ## Next steps (pick up here)
 
 1. **Phase 2 is done.** Phases 3 (ACP gaps, orchestration-as-script) and 4 (memory consolidation) haven't been started — see the source-level findings sections above for what's already scoped.
