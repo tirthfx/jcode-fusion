@@ -561,8 +561,53 @@ pub(super) async fn spawn_swarm_agent(
     soft_interrupt_queues: &SessionInterruptQueues,
     client_connections: &ClientConnections,
 ) -> anyhow::Result<String> {
+    // Fusion Phase 2: whether the caller explicitly requested a working_dir,
+    // captured before resolve_spawn_working_dir consumes `working_dir` --
+    // worktree isolation (below) only applies to the "would otherwise share
+    // the parent's directory" fallback path, never to an explicit request.
+    let working_dir_was_explicit = working_dir
+        .as_deref()
+        .is_some_and(|dir| !dir.trim().is_empty());
     let resolved_working_dir =
         resolve_spawn_working_dir(working_dir, req_session_id, sessions, swarm_members).await;
+
+    // Fusion Phase 2: opt-in worktree-per-subagent isolation (DESIGN.md §6
+    // item #2), only in the shared-directory fallback path. Fails open --
+    // any error creating a worktree just falls back to the pre-existing
+    // shared-directory behavior rather than failing the spawn.
+    let resolved_working_dir = if !working_dir_was_explicit
+        && crate::swarm_worktree::is_worktree_isolation_requested()
+    {
+        match resolved_working_dir.as_deref() {
+            Some(shared_dir) => {
+                match crate::swarm_worktree::create_worktree_for_spawn(
+                    std::path::Path::new(shared_dir),
+                    swarm_id,
+                )
+                .await
+                {
+                    Ok(worktree_path) => {
+                        crate::logging::info(&format!(
+                            "[swarm-worktree] isolated worker for swarm_id={swarm_id} into {}",
+                            worktree_path.display()
+                        ));
+                        Some(worktree_path.display().to_string())
+                    }
+                    Err(err) => {
+                        crate::logging::warn(&format!(
+                            "[swarm-worktree] failed to create worktree for swarm_id={swarm_id}, \
+                             falling back to the shared directory: {err}"
+                        ));
+                        resolved_working_dir
+                    }
+                }
+            }
+            None => resolved_working_dir,
+        }
+    } else {
+        resolved_working_dir
+    };
+
     let coordinator = resolve_coordinator_spawn_identity(req_session_id, sessions).await;
     let coordinator_is_canary = coordinator.is_canary;
     // Capture the requesting client's terminal env so spawn hooks place the new
