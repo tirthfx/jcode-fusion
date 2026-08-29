@@ -20,7 +20,7 @@
 |---|---|---|
 | **0 — Foundation** | Unified Mission Engine (#1) + provable-safe rewind (#4) | **Phase 0 complete.** Mission Engine (4/4 slices) + provable-safe rewind, all tested and pushed. |
 | **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **Phase 1 complete.** Sandboxing (macOS), Guardian (ambient-scoped, deny-only), execpolicy (Starlark, extends jcode-command-risk) all shipped. |
-| **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | Not started |
+| **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | **In progress** — creation slice done. Merge-back and cleanup not started. |
 | **3 — Ecosystem** | ACP support (#7), orchestration-as-script (#8) | Not started |
 | **4 — Memory** | Two-phase consolidation (#9) | Not started |
 
@@ -220,12 +220,22 @@ Full test suite: 1212 passed, 29 failed — confirmed identical (count and every
 
 **This completes Phase 1** — sandboxing, Guardian, and execpolicy all shipped.
 
+## Phase 2 first slice: worktree-per-subagent isolation (creation only) — DONE (2026-08-30)
+
+New `crates/jcode-app-core/src/swarm_worktree.rs`, wired into `server/comm_session.rs::spawn_swarm_agent` right after `resolve_spawn_working_dir` resolves — opt-in (`JCODE_FUSION_SWARM_WORKTREES=1`), applies only in the "would otherwise share the parent's directory" fallback path (an explicit `working_dir` request is left exactly as asked), fails open on any error.
+
+**Real, thorough live testing this time** — unlike some earlier slices, this one could be fully tested against actual `git` operations (real `git init` + commit in tempdir repos, not mocks): 9/9 passing, covering opt-in default-off, unique worker labels, repo-path bucketing by canonical path, resolving the repo root from a nested subdirectory, failing cleanly outside a repo, a worktree actually containing a real working checkout, **two concurrent worktrees proven genuinely independent** (a file written in one doesn't leak into the other or the original checkout), and `remove_worktree` actually removing the directory.
+
+**Deliberately creation-only, documented not hidden**: no automatic merge-back of a worker's worktree branch into the coordinator's tree (Grok Build's own pattern is an explicit "apply" step, not automatic — a reasonable model for later, not implemented here), no automatic cleanup of abandoned worktrees (crashed workers, cancelled swarms). `remove_worktree()` exists and is tested but nothing calls it automatically yet. The existing advisory file-touch conflict *detection* is untouched — this adds a structural layer on top, not a replacement.
+
+This touched core swarm spawn code directly (`comm_session.rs`), not just a new isolated module — ran the full test suite as a result: 1221 passed, 29 failed, confirmed identical (count and every test name) to the established baseline, including confirming `comm_session`'s own `prepare_visible_spawn_session_*` tests were *already* in that pre-existing failure list before this change touched the file. Zero regressions. Full binary rebuilds clean.
+
 ## Next steps (pick up here)
 
-1. **Phases 0 and 1 are both fully complete.** Phase 2 (worktree-per-subagent swarm isolation, #2) is next per DESIGN.md's roadmap.
-2. **Remaining follow-up work, not blocking, but real** (documented across Phase 1's slices): Guardian's auto-approve half (needs a real semantic judge), Linux/Windows sandboxing, execpolicy's resubmit-with-justification flow for user rules. None of these block starting Phase 2.
-3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` after every slice that touches shared infrastructure. Done consistently for sandboxing/Guardian/execpolicy — keep doing it for Phase 2.
-4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login) still hasn't happened for any piece beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
+1. **Phase 2's creation slice is done.** Next: either merge-back (apply a worker's worktree branch back into the coordinator's tree) or cleanup (remove abandoned worktrees) — both genuinely more involved than creation, and both risk losing a worker's actual work if gotten wrong, so pick whichever gets scoped carefully rather than rushed.
+2. **Remaining follow-up work from Phase 1, not blocking**: Guardian's auto-approve half (needs a real semantic judge), Linux/Windows sandboxing, execpolicy's resubmit-with-justification flow for user rules.
+3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` after every slice that touches shared infrastructure — done for this slice despite it touching core spawn code, and it caught nothing new (good sign, not a reason to stop checking).
+4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login, and specifically trying `JCODE_FUSION_SWARM_WORKTREES=1` with a real swarm spawn) still hasn't happened beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
 5. Update this file at the end of every session — status table, session log entry, next steps — before ending.
 
 ## Housekeeping reminder
