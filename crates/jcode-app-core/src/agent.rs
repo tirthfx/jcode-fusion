@@ -170,14 +170,6 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
-struct RewindUndoSnapshot {
-    messages: Vec<StoredMessage>,
-    provider_session_id: Option<String>,
-    session_provider_session_id: Option<String>,
-    visible_message_count: usize,
-}
-
 pub struct Agent {
     provider: Arc<dyn Provider>,
     registry: Registry,
@@ -242,8 +234,6 @@ pub struct Agent {
     agents_md_snapshot: (Option<String>, crate::prompt::ContextInfo),
     /// Whether memory features are enabled for this session
     memory_enabled: bool,
-    /// One-step undo snapshot captured before the most recent rewind.
-    rewind_undo_snapshot: Option<RewindUndoSnapshot>,
     /// Channel for tools to request stdin input from the user
     stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tool::StdinInputRequest>>,
     /// Canonical reducer-backed view of runtime provider/model selection.
@@ -322,7 +312,6 @@ impl Agent {
             system_prompt_override: None,
             agents_md_snapshot,
             memory_enabled: crate::config::config().features.memory,
-            rewind_undo_snapshot: None,
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
             inline_output_tap: false,
@@ -593,7 +582,12 @@ impl Agent {
         self.last_usage = TokenUsage::default();
         self.locked_tools = None;
         self.mcp_late_register_resolved = false;
-        self.rewind_undo_snapshot = None;
+        // Deliberately NOT clearing the persisted rewind stack
+        // (crate::rewind_store) here: this method resets lightweight
+        // runtime flags, not user-visible history. Losing rewind history as
+        // a side effect of an otherwise-unrelated state reset would be a
+        // surprising, harmful behavior change -- the stack should only be
+        // cleared by an explicit, deliberate action (e.g. session end).
     }
 
     /// Synchronize the remote client's selected skill, accepting only names

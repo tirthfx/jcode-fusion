@@ -235,6 +235,12 @@ impl Agent {
     /// Provider-side resumable sessions are reset so the next request sends the
     /// truncated context from scratch instead of continuing from a stale upstream
     /// conversation.
+    /// Fusion Phase 0, provable-safe rewind: pushes onto a persisted,
+    /// integrity-checked undo stack (`crate::rewind_store`) instead of the
+    /// old single in-memory snapshot — supports multiple undo levels and
+    /// survives a restart. See `rewind_store`'s module docs for the exact
+    /// scope (conversation state only, same as before; no filesystem/
+    /// tool-side-effect awareness yet).
     pub fn rewind_to_message(&mut self, message_index: usize) -> Result<usize, String> {
         let targets = self.session.rewind_target_stored_indices();
         let message_count = targets.len();
@@ -247,12 +253,14 @@ impl Agent {
         let stored_len = targets[message_index - 1] + 1;
 
         let removed = message_count - message_index;
-        self.rewind_undo_snapshot = Some(RewindUndoSnapshot {
-            messages: self.session.messages.clone(),
-            provider_session_id: self.provider_session_id.clone(),
-            session_provider_session_id: self.session.provider_session_id.clone(),
-            visible_message_count: message_count,
-        });
+        crate::rewind_store::push_snapshot(
+            &self.session.id,
+            self.session.messages.clone(),
+            self.provider_session_id.clone(),
+            self.session.provider_session_id.clone(),
+            message_count,
+        )
+        .map_err(|err| format!("failed to persist rewind snapshot: {err}"))?;
         self.session.truncate_messages(stored_len);
         self.session.updated_at = chrono::Utc::now();
         self.provider_session_id = None;
@@ -264,9 +272,22 @@ impl Agent {
         Ok(removed)
     }
 
+    /// Pops the most recent snapshot off the persisted undo stack. Calling
+    /// this repeatedly walks back through multiple prior rewinds (the old
+    /// implementation only supported one level). A snapshot that fails its
+    /// integrity check is **refused, not applied** — see
+    /// `rewind_store::PopOutcome::Corrupt`.
     pub fn undo_rewind(&mut self) -> Result<usize, String> {
-        let Some(snapshot) = self.rewind_undo_snapshot.take() else {
-            return Err("No rewind to undo.".to_string());
+        let outcome = crate::rewind_store::pop_snapshot(&self.session.id)
+            .map_err(|err| format!("failed to read rewind snapshot: {err}"))?;
+        let snapshot = match outcome {
+            crate::rewind_store::PopOutcome::Empty => {
+                return Err("No rewind to undo.".to_string());
+            }
+            crate::rewind_store::PopOutcome::Corrupt { reason } => {
+                return Err(format!("Refusing to undo: {reason}"));
+            }
+            crate::rewind_store::PopOutcome::Popped(snapshot) => snapshot,
         };
 
         let current_count = self.session.rewind_target_count();

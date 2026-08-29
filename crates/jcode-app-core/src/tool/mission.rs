@@ -53,10 +53,7 @@ impl Tool for MissionTool {
     }
 
     fn description(&self) -> &str {
-        "Set, inspect, or update a long-horizon mission for this session. \
-         While a mission is active, a reminder of its objective and intent \
-         is injected into future turns so the agent keeps working toward it \
-         across context compaction and interruptions."
+        "Track a long-horizon mission for this session."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -68,38 +65,30 @@ impl Tool for MissionTool {
                 "action": {
                     "type": "string",
                     "enum": ["set", "show", "status", "checkpoint", "check_budget", "success_criteria", "claim_complete", "verify_completion", "clear"],
-                    "description": "set: declare/replace the mission objective (also reactivates it). \
-                                    show: display the current mission, if any. \
-                                    status: change the mission's status (active/paused/blocked/needs_decision/budget_limited/abandoned — NOT complete, see claim_complete). \
-                                    checkpoint: record a progress note without changing status. \
-                                    check_budget: check real provider usage and, if any connected provider has hit its hard usage limit, transition the mission to budget_limited. \
-                                    success_criteria: declare/replace the criteria completion will be checked against. Do this before claim_complete. \
-                                    claim_complete: claim the mission is done, with evidence (does NOT mark it complete yet — pending verification). \
-                                    verify_completion: independently check the pending claim against success_criteria; only marks the mission complete if it holds up. Ideally called from a fresh perspective, not immediately after claim_complete in the same breath. \
-                                    clear: delete the mission entirely."
+                    "description": "Action."
                 },
                 "objective": {
                     "type": "string",
-                    "description": "Required for `set`. The mission's objective, in the agent's own words."
+                    "description": "Mission objective."
                 },
                 "status": {
                     "type": "string",
                     "enum": ["active", "paused", "blocked", "needs_decision", "budget_limited", "abandoned"],
-                    "description": "Required for `status`. Does not include `complete` — see claim_complete/verify_completion."
+                    "description": "New status."
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Required for `checkpoint`. A short note on progress since the last checkpoint."
+                    "description": "Checkpoint note."
                 },
                 "criteria": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Required for `success_criteria`. Concrete, checkable criteria for what 'done' means."
+                    "description": "Success criteria."
                 },
                 "evidence": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Required for `claim_complete`. Specific, substantive evidence — not bare affirmations like \"done\" — ideally with roughly one item per success criterion."
+                    "description": "Completion evidence."
                 }
             }
         })
