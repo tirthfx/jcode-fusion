@@ -50,6 +50,15 @@ pub struct MissionCheckpoint {
     pub summary: String,
 }
 
+/// A self-reported claim that the mission is complete, pending independent
+/// verification. Recording a claim does NOT change `status` — see
+/// [`claim_complete`] and [`verify_completion`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionClaim {
+    pub evidence: Vec<String>,
+    pub claimed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mission {
     pub session_id: String,
@@ -64,6 +73,8 @@ pub struct Mission {
     pub validation_plan: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<MissionCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_completion_claim: Option<CompletionClaim>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -91,6 +102,7 @@ pub fn set(session_id: &str, objective: &str) -> Result<Mission> {
         success_criteria: Vec::new(),
         validation_plan: Vec::new(),
         checkpoints: Vec::new(),
+        pending_completion_claim: None,
         created_at: now,
         updated_at: now,
     });
@@ -102,7 +114,41 @@ pub fn set(session_id: &str, objective: &str) -> Result<Mission> {
     Ok(mission)
 }
 
+/// Declare (or replace) the mission's success criteria — the contract that
+/// [`verify_completion`] checks a completion claim against. Without this,
+/// there is nothing for completion verification to verify against, so a
+/// mission with no criteria can never pass `verify_completion` (see
+/// `claim_meets_bar`).
+pub fn set_success_criteria(session_id: &str, criteria: Vec<String>) -> Result<Option<Mission>> {
+    let criteria: Vec<String> = criteria
+        .into_iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let Some(mut mission) = load(session_id)? else {
+        return Ok(None);
+    };
+    mission.success_criteria = criteria;
+    mission.updated_at = Utc::now();
+    save(&mission)?;
+    Ok(Some(mission))
+}
+
+/// Update mission status. **Cannot be used to reach `Complete`** — that
+/// transition must go through [`claim_complete`] + [`verify_completion`]
+/// (Fusion Phase 0, third slice: completion verification). Direct
+/// self-certified completion is exactly the gap this project set out to
+/// close (see jcode-fusion/DESIGN.md §6 item #1, Grok Build's `/goal`
+/// adversarial-verifier idea) — allowing `update_status(.., Complete)` to
+/// work would silently defeat the whole feature.
 pub fn update_status(session_id: &str, status: MissionStatus) -> Result<Option<Mission>> {
+    if status == MissionStatus::Complete {
+        anyhow::bail!(
+            "cannot set status to complete directly; use claim_complete (with evidence) \
+             followed by verify_completion instead — completion must be claimed with \
+             evidence and independently verified, not self-certified"
+        );
+    }
     let Some(mut mission) = load(session_id)? else {
         return Ok(None);
     };
@@ -110,6 +156,124 @@ pub fn update_status(session_id: &str, status: MissionStatus) -> Result<Option<M
     mission.updated_at = Utc::now();
     save(&mission)?;
     Ok(Some(mission))
+}
+
+/// Minimum length, after trimming, for a single piece of completion
+/// evidence to be considered substantive. Mirrors the anti-rubber-stamp
+/// pattern already used elsewhere in jcode for exactly this purpose (see
+/// `jcode-command-risk`'s `Justification::is_substantive()`, a ~25-char
+/// minimum for destructive-command justifications) rather than inventing a
+/// new convention.
+const MIN_EVIDENCE_LEN: usize = 20;
+
+fn evidence_is_substantive(item: &str) -> bool {
+    let trimmed = item.trim();
+    if trimmed.chars().count() < MIN_EVIDENCE_LEN {
+        return false;
+    }
+    const BARE_AFFIRMATIONS: &[&str] = &[
+        "done",
+        "yes",
+        "complete",
+        "completed",
+        "finished",
+        "ok",
+        "okay",
+        "it works",
+        "all good",
+        "should be fine",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    !BARE_AFFIRMATIONS.contains(&lower.as_str())
+}
+
+/// Step 1 of completion verification: record a self-reported claim that the
+/// mission is complete, with evidence. **Does not change `status`** — the
+/// mission stays wherever it was (typically `Active`) until
+/// [`verify_completion`] actually confirms it. Each evidence item must be
+/// substantive (see [`evidence_is_substantive`]); bare affirmations like
+/// "done" are rejected outright rather than silently accepted.
+pub fn claim_complete(session_id: &str, evidence: Vec<String>) -> Result<Option<Mission>> {
+    if evidence.is_empty() {
+        anyhow::bail!("completion claim requires at least one piece of evidence");
+    }
+    if let Some(weak) = evidence.iter().find(|e| !evidence_is_substantive(e)) {
+        anyhow::bail!(
+            "evidence item is not substantive enough (must be a real, specific claim, \
+             not a bare affirmation): \"{}\"",
+            weak.trim()
+        );
+    }
+    let Some(mut mission) = load(session_id)? else {
+        return Ok(None);
+    };
+    mission.pending_completion_claim = Some(CompletionClaim {
+        evidence,
+        claimed_at: Utc::now(),
+    });
+    mission.updated_at = Utc::now();
+    save(&mission)?;
+    Ok(Some(mission))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationOutcome {
+    /// No completion claim is currently pending for this mission.
+    NoPendingClaim,
+    /// The claim was refuted — the mission stays exactly as it was (still
+    /// carrying the pending claim, still not `Complete`).
+    Refuted { reason: String },
+    /// The claim was confirmed — the mission has been transitioned to
+    /// `Complete` and the pending claim cleared.
+    Confirmed { mission: Mission },
+}
+
+/// Step 2 of completion verification: independently assess a pending
+/// completion claim and, only if it holds up, actually transition the
+/// mission to `Complete`.
+///
+/// **Important limitation, documented deliberately rather than silently
+/// shipped as if solved**: this first slice's verification is a real,
+/// enforced, code-level structural check (does the evidence plausibly cover
+/// the declared success criteria?) — not yet a genuinely independent LLM
+/// review of the actual evidence's truth. A real semantic verifier (e.g.
+/// spawning a fresh, separate `Agent` via `Agent::run_once_capture`, the
+/// same primitive `overnight.rs::run_supervisor` already uses, with a
+/// tightly-scoped "try to refute this claim" prompt) is the natural next
+/// step once this scaffold is in place — see PROGRESS.md. This function is
+/// also, today, callable by the same session/turn that filed the claim;
+/// nothing yet enforces that a *different* identity must call it. Both
+/// gaps are intentional scope boundaries for this slice, not oversights.
+pub fn verify_completion(session_id: &str) -> Result<VerificationOutcome> {
+    let Some(mission) = load(session_id)? else {
+        return Ok(VerificationOutcome::NoPendingClaim);
+    };
+    let Some(claim) = mission.pending_completion_claim.clone() else {
+        return Ok(VerificationOutcome::NoPendingClaim);
+    };
+    if mission.success_criteria.is_empty() {
+        return Ok(VerificationOutcome::Refuted {
+            reason: "mission has no success criteria set (use the `success_criteria` action) \
+                      — completion cannot be verified against nothing"
+                .to_string(),
+        });
+    }
+    if claim.evidence.len() < mission.success_criteria.len() {
+        return Ok(VerificationOutcome::Refuted {
+            reason: format!(
+                "{} success criteria declared but only {} evidence item(s) provided — \
+                 not every criterion appears to be addressed",
+                mission.success_criteria.len(),
+                claim.evidence.len()
+            ),
+        });
+    }
+    let mut confirmed = mission;
+    confirmed.status = MissionStatus::Complete;
+    confirmed.pending_completion_claim = None;
+    confirmed.updated_at = Utc::now();
+    save(&confirmed)?;
+    Ok(VerificationOutcome::Confirmed { mission: confirmed })
 }
 
 pub fn checkpoint(session_id: &str, summary: &str) -> Result<Option<Mission>> {
@@ -247,6 +411,170 @@ fn default_long_horizon_intent(objective: &str) -> String {
         "Interpret `{}` broadly: pursue the literal objective, continuously refresh the todo frontier, include semantically adjacent work that improves the outcome, and preserve long-term quality.",
         objective
     )
+}
+
+#[cfg(test)]
+mod completion_verification_tests {
+    use super::*;
+
+    #[test]
+    fn bare_affirmations_are_not_substantive() {
+        for weak in ["done", "Yes", "COMPLETE", "  ok  ", "it works", "all good"] {
+            assert!(
+                !evidence_is_substantive(weak),
+                "expected {:?} to be rejected as not substantive",
+                weak
+            );
+        }
+    }
+
+    #[test]
+    fn short_strings_are_not_substantive() {
+        assert!(!evidence_is_substantive("ran the tests ok"));
+    }
+
+    #[test]
+    fn real_evidence_is_substantive() {
+        assert!(evidence_is_substantive(
+            "Ran `cargo test -p jcode-app-core mission`, all 19 tests pass"
+        ));
+    }
+
+    fn with_isolated_home<F: FnOnce()>(f: F) {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        f();
+        if let Some(prev_home) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    #[test]
+    fn claim_complete_rejects_empty_and_weak_evidence() {
+        with_isolated_home(|| {
+            let session_id = "ses_claim_reject";
+            set(session_id, "Ship the verifier").expect("set mission");
+
+            assert!(claim_complete(session_id, vec![]).is_err());
+            assert!(claim_complete(session_id, vec!["done".to_string()]).is_err());
+
+            // A weak claim must not have mutated the mission.
+            let mission = load(session_id).expect("load").expect("exists");
+            assert!(mission.pending_completion_claim.is_none());
+        });
+    }
+
+    #[test]
+    fn update_status_cannot_reach_complete_directly() {
+        with_isolated_home(|| {
+            let session_id = "ses_no_direct_complete";
+            set(session_id, "Ship the verifier").expect("set mission");
+            assert!(update_status(session_id, MissionStatus::Complete).is_err());
+            let mission = load(session_id).expect("load").expect("exists");
+            assert_eq!(mission.status, MissionStatus::Active);
+        });
+    }
+
+    #[test]
+    fn verify_completion_refutes_without_success_criteria() {
+        with_isolated_home(|| {
+            let session_id = "ses_no_criteria";
+            set(session_id, "Ship the verifier").expect("set mission");
+            claim_complete(
+                session_id,
+                vec!["Ran the full test suite and everything passed cleanly".to_string()],
+            )
+            .expect("claim");
+
+            let outcome = verify_completion(session_id).expect("verify");
+            match outcome {
+                VerificationOutcome::Refuted { reason } => {
+                    assert!(reason.contains("no success criteria"));
+                }
+                other => panic!("expected Refuted, got {:?}", other),
+            }
+            // Refuted claims stay pending, not silently dropped.
+            let mission = load(session_id).expect("load").expect("exists");
+            assert!(mission.pending_completion_claim.is_some());
+            assert_eq!(mission.status, MissionStatus::Active);
+        });
+    }
+
+    #[test]
+    fn verify_completion_refutes_insufficient_evidence_coverage() {
+        with_isolated_home(|| {
+            let session_id = "ses_insufficient_evidence";
+            set(session_id, "Ship the verifier").expect("set mission");
+            set_success_criteria(
+                session_id,
+                vec![
+                    "All unit tests pass".to_string(),
+                    "Manually verified in a live run".to_string(),
+                ],
+            )
+            .expect("set criteria");
+            claim_complete(
+                session_id,
+                vec!["Ran the full test suite and everything passed cleanly".to_string()],
+            )
+            .expect("claim");
+
+            let outcome = verify_completion(session_id).expect("verify");
+            assert!(matches!(outcome, VerificationOutcome::Refuted { .. }));
+        });
+    }
+
+    #[test]
+    fn verify_completion_confirms_when_claim_meets_the_bar() {
+        with_isolated_home(|| {
+            let session_id = "ses_confirmed";
+            set(session_id, "Ship the verifier").expect("set mission");
+            set_success_criteria(
+                session_id,
+                vec![
+                    "All unit tests pass".to_string(),
+                    "Manually verified in a live run".to_string(),
+                ],
+            )
+            .expect("set criteria");
+            claim_complete(
+                session_id,
+                vec![
+                    "Ran `cargo test -p jcode-app-core mission`, all tests passed".to_string(),
+                    "Ran the mission_tool_demo example end to end and inspected the output"
+                        .to_string(),
+                ],
+            )
+            .expect("claim");
+
+            let outcome = verify_completion(session_id).expect("verify");
+            match outcome {
+                VerificationOutcome::Confirmed { mission } => {
+                    assert_eq!(mission.status, MissionStatus::Complete);
+                    assert!(mission.pending_completion_claim.is_none());
+                }
+                other => panic!("expected Confirmed, got {:?}", other),
+            }
+
+            // Once Complete, the reminder must stop (same guarantee already
+            // covered for Blocked in tool/mission_tests.rs).
+            assert!(active_system_reminder(session_id).expect("reminder").is_none());
+        });
+    }
+
+    #[test]
+    fn verify_completion_with_no_pending_claim() {
+        with_isolated_home(|| {
+            let session_id = "ses_no_claim";
+            set(session_id, "Ship the verifier").expect("set mission");
+            let outcome = verify_completion(session_id).expect("verify");
+            assert_eq!(outcome, VerificationOutcome::NoPendingClaim);
+        });
+    }
 }
 
 #[cfg(test)]

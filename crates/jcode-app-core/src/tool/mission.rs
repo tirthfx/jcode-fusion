@@ -1,12 +1,20 @@
-//! Agent-facing tool for `crate::mission` — the first Phase 0 slice of the
-//! Fusion project's Mission Engine work (see jcode-fusion/DESIGN.md §6 item
-//! #1 and PROGRESS.md). `crate::mission::set`/`update_status`/`checkpoint`/
-//! `clear` already existed but had zero callers anywhere in the codebase;
-//! this tool gives them real callers so an agent can actually declare and
-//! track a long-horizon mission for its own session. Deliberately minimal —
-//! it wires up the existing functions as-is, without adding budget
-//! enforcement, completion verification, or an outer supervisor loop (those
-//! are later Phase 0 steps, not this one).
+//! Agent-facing tool for `crate::mission` — Fusion project's Mission Engine
+//! work (see jcode-fusion/DESIGN.md §6 item #1 and PROGRESS.md).
+//!
+//! Slice 1: gave `crate::mission::set`/`update_status`/`checkpoint`/`clear`
+//! (which already existed but had zero callers) real callers.
+//! Slice 2: `check_budget`, real (not heuristic) budget enforcement.
+//! Slice 3 (this one): `success_criteria`/`claim_complete`/
+//! `verify_completion` — completion can no longer be self-certified via
+//! `status`; it must be claimed with evidence and pass a real, enforced
+//! check against declared success criteria. See `crate::mission`'s doc
+//! comments on `claim_complete`/`verify_completion` for exactly what is and
+//! isn't verified yet (an LLM-based independent review is the natural next
+//! step, not yet built).
+//!
+//! Still not done: an outer supervisor loop tying budget + verification +
+//! the continuation-reminder mechanism together into something that
+//! actually runs unattended (modeled on `overnight.rs::run_supervisor`).
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::mission::MissionStatus;
@@ -32,6 +40,10 @@ struct MissionInput {
     status: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+    #[serde(default)]
+    criteria: Option<Vec<String>>,
+    #[serde(default)]
+    evidence: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -55,12 +67,15 @@ impl Tool for MissionTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["set", "show", "status", "checkpoint", "check_budget", "clear"],
+                    "enum": ["set", "show", "status", "checkpoint", "check_budget", "success_criteria", "claim_complete", "verify_completion", "clear"],
                     "description": "set: declare/replace the mission objective (also reactivates it). \
                                     show: display the current mission, if any. \
-                                    status: change the mission's status (active/paused/blocked/needs_decision/budget_limited/complete/abandoned). \
+                                    status: change the mission's status (active/paused/blocked/needs_decision/budget_limited/abandoned — NOT complete, see claim_complete). \
                                     checkpoint: record a progress note without changing status. \
                                     check_budget: check real provider usage and, if any connected provider has hit its hard usage limit, transition the mission to budget_limited. \
+                                    success_criteria: declare/replace the criteria completion will be checked against. Do this before claim_complete. \
+                                    claim_complete: claim the mission is done, with evidence (does NOT mark it complete yet — pending verification). \
+                                    verify_completion: independently check the pending claim against success_criteria; only marks the mission complete if it holds up. Ideally called from a fresh perspective, not immediately after claim_complete in the same breath. \
                                     clear: delete the mission entirely."
                 },
                 "objective": {
@@ -69,12 +84,22 @@ impl Tool for MissionTool {
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["active", "paused", "blocked", "needs_decision", "budget_limited", "complete", "abandoned"],
-                    "description": "Required for `status`."
+                    "enum": ["active", "paused", "blocked", "needs_decision", "budget_limited", "abandoned"],
+                    "description": "Required for `status`. Does not include `complete` — see claim_complete/verify_completion."
                 },
                 "summary": {
                     "type": "string",
                     "description": "Required for `checkpoint`. A short note on progress since the last checkpoint."
+                },
+                "criteria": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Required for `success_criteria`. Concrete, checkable criteria for what 'done' means."
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Required for `claim_complete`. Specific, substantive evidence — not bare affirmations like \"done\" — ideally with roughly one item per success criterion."
                 }
             }
         })
@@ -144,6 +169,53 @@ impl Tool for MissionTool {
                         .with_title(mission.objective.clone())
                         .with_metadata(serde_json::to_value(&mission)?)),
                         None => Ok(ToolOutput::new("No mission set for this session.")),
+                    }
+                }
+                "success_criteria" => {
+                    let criteria = params
+                        .criteria
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("criteria is required for success_criteria"))?;
+                    let mission = crate::mission::set_success_criteria(&ctx.session_id, criteria)?
+                        .ok_or_else(|| anyhow::anyhow!("no mission set for this session"))?;
+                    Ok(ToolOutput::new(crate::mission::render_status(&mission))
+                        .with_title(mission.objective.clone())
+                        .with_metadata(serde_json::to_value(&mission)?))
+                }
+                "claim_complete" => {
+                    let evidence = params
+                        .evidence
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("evidence is required for claim_complete"))?;
+                    let mission = crate::mission::claim_complete(&ctx.session_id, evidence)?
+                        .ok_or_else(|| anyhow::anyhow!("no mission set for this session"))?;
+                    Ok(ToolOutput::new(format!(
+                        "Completion claim recorded, pending verification. Call `verify_completion` \
+                         to check it. {}",
+                        crate::mission::render_status(&mission)
+                    ))
+                    .with_title(mission.objective.clone())
+                    .with_metadata(serde_json::to_value(&mission)?))
+                }
+                "verify_completion" => {
+                    match crate::mission::verify_completion(&ctx.session_id)? {
+                        crate::mission::VerificationOutcome::NoPendingClaim => {
+                            Ok(ToolOutput::new(
+                                "No pending completion claim for this mission. Use \
+                                 `claim_complete` first.",
+                            ))
+                        }
+                        crate::mission::VerificationOutcome::Refuted { reason } => Ok(
+                            ToolOutput::new(format!("Completion claim refuted: {}", reason)),
+                        ),
+                        crate::mission::VerificationOutcome::Confirmed { mission } => Ok(
+                            ToolOutput::new(format!(
+                                "Completion claim confirmed. {}",
+                                crate::mission::render_status(&mission)
+                            ))
+                            .with_title(mission.objective.clone())
+                            .with_metadata(serde_json::to_value(&mission)?),
+                        ),
                     }
                 }
                 "clear" => {
