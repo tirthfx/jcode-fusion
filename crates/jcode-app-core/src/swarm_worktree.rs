@@ -172,9 +172,21 @@ pub fn is_managed_worktree_path(path: &Path) -> bool {
         return false;
     };
     let managed_root = jcode_dir.join("worktrees");
-    let canonical_managed_root =
-        std::fs::canonicalize(&managed_root).unwrap_or(managed_root);
-    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Both sides must resolve for real -- no falling back to an
+    // uncanonicalized path on either one. `Path::starts_with` compares
+    // components lexically, not the resolved filesystem path; canonicalize's
+    // usual "just use the raw path" fallback on a missing/unreadable path
+    // would let a crafted, nonexistent `.../worktrees/x/../../secrets`-style
+    // string pass a component-wise prefix check without its `..` segments
+    // ever actually being resolved. A worktree this module created always
+    // exists on disk, so requiring both sides to canonicalize costs nothing
+    // real and closes that edge case.
+    let Ok(canonical_managed_root) = std::fs::canonicalize(&managed_root) else {
+        return false;
+    };
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
     canonical_path.starts_with(&canonical_managed_root)
 }
 
@@ -245,7 +257,15 @@ async fn list_conflicted_paths(repo_root: &Path) -> anyhow::Result<Vec<String>> 
             let status = line.get(0..2).unwrap_or("");
             matches!(status, "UU" | "AA" | "DD" | "AU" | "UA" | "DU" | "UD")
         })
-        .filter_map(|line| line.get(3..).map(|s| s.to_string()))
+        .filter_map(|line| {
+            // `git status --porcelain` wraps a path containing spaces or
+            // other special characters in double quotes -- strip them so a
+            // conflict report doesn't show a filename with literal quote
+            // characters baked in. Cosmetic only: this list is for a human
+            // (or an agent) reading the tool's response text, not something
+            // re-parsed by git.
+            line.get(3..).map(|s| s.trim_matches('"').to_string())
+        })
         .collect();
     files.sort();
     files.dedup();
@@ -323,30 +343,58 @@ pub async fn merge_worktree_branch(
         return Ok(MergeOutcome::Merged { commit_sha });
     }
 
-    // Conflict (or some other merge failure) -- collect what we can, then
-    // unconditionally abort so the repo never sits mid-merge.
+    // Conflict (or some other merge failure). First check whether git
+    // actually entered a merge state at all: a pre-flight refusal (e.g. the
+    // coordinator's own tree has uncommitted changes that would be
+    // overwritten) never creates MERGE_HEAD, and in that case `git merge
+    // --abort` would itself fail with "There is no merge to abort" -- a
+    // false alarm, not a real "repo left mid-merge" problem. Only run (and
+    // require) a real abort when a merge was genuinely in progress.
+    let merge_head = repo_root.join(".git").join("MERGE_HEAD");
+    let merge_was_in_progress = tokio::fs::try_exists(&merge_head).await.unwrap_or(false);
     let files = list_conflicted_paths(repo_root).await.unwrap_or_default();
-    let abort = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("merge")
-        .arg("--abort")
-        .output()
-        .await;
-    if let Err(e) = abort {
-        anyhow::bail!(
-            "merge of '{branch}' failed and `git merge --abort` itself could not run ({e}) -- \
-             repo at {} may be left mid-merge, needs manual attention",
-            repo_root.display()
-        );
+
+    if merge_was_in_progress {
+        let abort = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("merge")
+            .arg("--abort")
+            .output()
+            .await;
+        match abort {
+            Err(e) => {
+                anyhow::bail!(
+                    "merge of '{branch}' failed and `git merge --abort` itself could not run \
+                     ({e}) -- repo at {} may be left mid-merge, needs manual attention",
+                    repo_root.display()
+                );
+            }
+            // A spawn that succeeds but returns a failing exit code (e.g. an
+            // index lock held by another process) is just as dangerous as a
+            // spawn error here -- either way the repo may still be mid-merge,
+            // and silently returning `Conflict` as if it had been cleanly
+            // reverted would be a false "safe" report.
+            Ok(output) if !output.status.success() => {
+                anyhow::bail!(
+                    "merge of '{branch}' failed and `git merge --abort` itself failed ({}) -- \
+                     repo at {} is likely still mid-merge, needs manual attention",
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    repo_root.display()
+                );
+            }
+            Ok(_) => {}
+        }
     }
 
     if files.is_empty() {
-        // Merge failed for a reason that wasn't a content conflict (e.g. a
+        // Merge failed for a reason that wasn't a content conflict (e.g. the
+        // coordinator's own tree had uncommitted changes in the way, or a
         // local pre-merge hook rejected it). Surface the real stderr rather
         // than reporting a misleading empty conflict list.
         anyhow::bail!(
-            "git merge failed and was aborted: {}",
+            "git merge failed{}: {}",
+            if merge_was_in_progress { " and was aborted" } else { "" },
             String::from_utf8_lossy(&merge.stderr).trim()
         );
     }
@@ -744,6 +792,53 @@ mod tests {
         );
         let readme = std::fs::read_to_string(repo.path().join("README.md")).expect("read");
         assert_eq!(readme, "coordinator's version\n");
+    }
+
+    /// Regression test for a real bug an external review caught: when the
+    /// *coordinator's own tree* (not the worktree) has an uncommitted change
+    /// git would need to overwrite, `git merge` refuses before it even
+    /// starts -- no `MERGE_HEAD` is ever created. The old code unconditionally
+    /// ran `git merge --abort` in this situation too, which would itself
+    /// fail ("There is no merge to abort") in a way that was easy to
+    /// conflate with "abort of a real conflict failed." This confirms the
+    /// call bails with the real git error, without ever pretending a merge
+    /// was attempted-and-aborted.
+    #[tokio::test]
+    async fn merge_worktree_branch_reports_a_dirty_coordinator_tree_cleanly() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-vs-dirty-coordinator")
+            .await
+            .expect("create");
+        std::fs::write(worktree_path.join("README.md"), "worker's version\n")
+            .expect("write worker side");
+        git_ok(&worktree_path, &["add", "."]);
+        git_ok(&worktree_path, &["commit", "-q", "-m", "worker: edit README"]);
+
+        // The coordinator's own tree has an *uncommitted* change to the same
+        // file -- deliberately not committed, so this is a pre-flight
+        // refusal, not a content conflict.
+        std::fs::write(repo.path().join("README.md"), "coordinator's uncommitted edit\n")
+            .expect("write coordinator side, uncommitted");
+
+        let result = merge_worktree_branch(repo.path(), &worktree_path).await;
+        assert!(
+            result.is_err(),
+            "must not report Merged or Conflict for a pre-flight refusal"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            !message.contains("and was aborted"),
+            "no merge was ever in progress, so the message must not claim one was aborted: {message}"
+        );
+
+        // No trace of a merge attempt should be left behind.
+        assert!(!repo.path().join(".git").join("MERGE_HEAD").exists());
+        let uncommitted = std::fs::read_to_string(repo.path().join("README.md")).expect("read");
+        assert_eq!(uncommitted, "coordinator's uncommitted edit\n");
     }
 
     #[tokio::test]
