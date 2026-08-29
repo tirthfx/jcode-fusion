@@ -19,7 +19,7 @@
 | Phase | Contents | Status |
 |---|---|---|
 | **0 — Foundation** | Unified Mission Engine (#1) + provable-safe rewind (#4) | **Phase 0 complete.** Mission Engine (4/4 slices) + provable-safe rewind, all tested and pushed. |
-| **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **In progress** — sandboxing first slice done (see session log). Guardian, execpolicy not started. |
+| **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **In progress** — sandboxing (macOS) done, Guardian (ambient-scoped, deny-only) done. execpolicy not started. |
 | **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | Not started |
 | **3 — Ecosystem** | ACP support (#7), orchestration-as-script (#8) | Not started |
 | **4 — Memory** | Two-phase consolidation (#9) | Not started |
@@ -196,12 +196,20 @@ User's decision: whole-process (not helper-process-for-file-tools). New `crates/
 
 **Still open for Phase 1**: Linux (bwrap) sandboxing not started (later, per the macOS-first decision). Guardian and execpolicy not started.
 
+## Phase 1: Guardian auto-approval reviewer — DONE (2026-08-30)
+
+Ambient-scoped, deny-only, per the earlier decision. New `crates/jcode-app-core/src/guardian.rs`: deterministic keyword-based adjudication against Codex's own four risk categories (destructive action, credential probing, data exfiltration, persistent security weakening), wired into `tool::ambient::RequestPermissionTool::execute` right before the existing `system.request_permission(request)` call. A `Deny` verdict skips the human queue entirely; `Undecided` falls through completely unchanged.
+
+**Deliberately never auto-approves** — same honesty principle as everywhere else in this project: a trustworthy auto-approve verdict needs a real semantic judge (LLM call, not reliably testable without live credentials here) or much more structured input than the free-text fields callers currently provide. Auto-approving on keyword-*absence* is a much weaker signal than denying on keyword-*presence*, so only the safe half (deny obviously-bad requests before a human even sees them) is implemented. The interruption-reduction half (the actual stated point of Codex's Guardian) is honest future work, not faked with a weak heuristic.
+
+7 new tests, all passing. Ran the full `jcode-app-core` test suite (not just scoped filters, per the lesson from the rewind slice) — 1202 passed, 29 failed, and confirmed the failure count and every individual test name are identical to the last full-suite run — zero new regressions from Guardian. Full binary rebuilds clean.
+
 ## Next steps (pick up here)
 
-1. **Phase 0 is fully complete.** Phase 1's sandboxing (macOS) first slice is done. Guardian reviewer and execpolicy are next.
-2. **Before writing more Phase 1 code, resolve the remaining open decisions** (see "Full review pass complete" section above): Guardian's scope (ambient-only vs. general — recommend ambient-only, matches what exists), execpolicy vs. the existing `jcode-command-risk` classifier (recommend extending `jcode-command-risk` with Starlark-configurable rules rather than a parallel system), and the file-edit-tool sandboxing gap (whole-process vs. helper-process — flagged earlier as the one genuinely open question, not yet decided).
-3. **Lesson from this slice, apply going forward**: run the *full* `cargo test -p jcode-app-core --lib` (not just a scoped filter) at least once per phase, not just once per slice within a phase — the token-cap regression sat undetected across 3 prior slices because only mission-scoped filters were run. Cheap to check, expensive to accumulate.
-4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login) still hasn't happened for any Phase 0 piece beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
+1. **Phase 0 is fully complete. Phase 1: sandboxing (macOS) done, Guardian done.** execpolicy (#6) is the last piece of Phase 1.
+2. **Only one open decision left for Phase 1**: execpolicy (#6) vs. the existing `jcode-command-risk` classifier — recommend extending `jcode-command-risk` with Starlark-configurable rules rather than a parallel system (still just a recommendation, not locked in by the user yet). Guardian's scope and sandboxing's scope are both resolved and shipped now.
+3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` (not just a scoped filter) after every slice that touches shared infrastructure — cheap to check, expensive to accumulate. Done for both the sandboxing and Guardian slices; keep doing it.
+4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login) still hasn't happened for any Phase 0/1 piece beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
 5. Update this file at the end of every session — status table, session log entry, next steps — before ending.
 
 ## Housekeeping reminder
