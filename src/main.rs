@@ -132,6 +132,15 @@ fn run_main() -> Result<()> {
         return jcode::cli::macos_notification_broker::run();
     }
 
+    // Fusion Phase 1: opt-in whole-process sandboxing (JCODE_FUSION_SANDBOX=1
+    // on macOS). Never returns on success -- the process image is replaced
+    // by a `sandbox-exec`-wrapped re-exec of this same binary. Fails open on
+    // any error (logs, continues unsandboxed) rather than refusing to start.
+    // Must run before the tokio runtime starts: re-exec has to happen from a
+    // clean single-threaded process, not from inside an async runtime with
+    // worker threads already spawned.
+    jcode::sandbox_macos::maybe_reexec_under_sandbox();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
