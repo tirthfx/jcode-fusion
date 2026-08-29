@@ -150,7 +150,23 @@ Added `mission::enforce_budget(session_id)` — checks real provider usage via `
 
 ## Repo pushed to GitHub (2026-08-29)
 
-`github.com/tirthfx/jcode-fusion` (private). Committed both Phase 0 slices as one commit on a new `main` branch (the clone was in detached HEAD from the tag checkout). Remotes: `origin` = the new fork, `upstream` = real `1jehuang/jcode`.
+`github.com/tirthfx/jcode-fusion` (private). **Not a full-history push** — the real `1jehuang/jcode` history (~7,237 commits, ~349MB) repeatedly hit GitHub HTTP 408 timeouts from this connection, on both the full-history push and an orphan-commit squash of it. Root cause turned out to be `assets/` (169MB of README demo GIFs/MP4s, confirmed via source grep to be unreferenced by any `include_bytes!`/`include_str!` — not needed to build or run). Excluded `assets/` and pushed a single squashed commit instead — landed cleanly.
+
+**What's actually on GitHub now**: one commit containing the full `v0.81.2` source tree (minus `assets/`) plus Fusion's Phase 0 changes, plus `DESIGN.md`/`PROGRESS.md` at the repo root (copied in from the parent `jcode-fusion/` dir, which they lived in locally and were missed on the first push). **Not** the full upstream commit history — that stays available locally via `git remote add upstream https://github.com/1jehuang/jcode.git` (already configured on the local checkout) if ever needed, e.g. to properly rebase against upstream changes later.
+
+Local branch `fusion-main` tracks `origin/main`. The original full-history branch (`main`, from the tag checkout) still exists locally, untouched, just not pushed.
+
+**Follow-up (2026-08-29, same day)**: the first push included jcode's own `.github/workflows/` (9 files — release publishing, Windows/FreeBSD smoke tests, TestFlight, etc.), which auto-triggered on push and failed (no matching secrets/runners/repo context), sending a batch of GitHub failure-notification emails. Removed all 9 workflow files and pushed the removal — future pushes won't retrigger anything. Optional extra safety net not done (no tool access to it): flipping the repo's Settings → Actions → General to fully disabled.
+
+## Phase 0 third slice: completion verification — DONE (2026-08-29)
+
+Self-certified completion is now closed off: `update_status()` refuses `Complete` outright. Real flow: `success_criteria` (new — declares what "done" means; a prerequisite slice 1 deliberately skipped) → `claim_complete` (evidence required, bare affirmations like "done"/"ok" rejected via a substantiveness check mirroring `jcode-command-risk`'s existing `Justification::is_substantive()` pattern — reused the convention rather than inventing a new one) → `verify_completion` (the actual gate: refuses with no criteria set, refuses if evidence count doesn't cover criteria count, only then transitions to `Complete`).
+
+**Two scope limits, documented in the code itself, not silently glossed over**:
+1. Verification is a real, enforced *structural* check (evidence coverage vs. criteria count) — not yet a genuine LLM-based independent review of whether the evidence is actually *true*. A real semantic verifier (spawning a fresh `Agent` via `Agent::run_once_capture`, the same primitive `overnight.rs::run_supervisor` uses, with a "try to refute this" prompt) is the natural next step once this scaffold exists.
+2. Nothing yet stops the same session/turn that filed the claim from also being the one that calls `verify_completion` — true decoupling (a different identity doing the verifying) isn't enforced yet.
+
+9 new tests, all passing (25/25 across the full mission suite, 1 pre-existing unrelated test skipped as always). Full `jcode-fusion` binary rebuilds clean. Committed and pushed.
 
 ## Next steps (pick up here)
 
