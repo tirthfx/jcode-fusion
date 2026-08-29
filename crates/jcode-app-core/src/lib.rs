@@ -32,6 +32,7 @@ pub mod build;
 pub mod catchup;
 pub mod channel;
 pub mod external_auth;
+pub mod guardian;
 pub mod mission;
 pub mod network_retry;
 pub mod notifications;

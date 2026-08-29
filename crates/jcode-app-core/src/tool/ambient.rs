@@ -679,8 +679,24 @@ impl Tool for RequestPermissionTool {
             context: Some(request_context),
         };
 
-        let system = get_safety_system();
-        let result = system.request_permission(request);
+        // Fusion Phase 1: Guardian auto-denies obviously-bad requests before
+        // they even reach the human queue. Never auto-approves (see
+        // crate::guardian module docs for why) -- an Undecided verdict
+        // falls through to the existing request_permission/human-queue path
+        // completely unchanged.
+        let guardian_verdict = crate::guardian::adjudicate(&request);
+        let result = if guardian_verdict.decision == crate::guardian::GuardianDecision::Deny {
+            crate::logging::info(&format!(
+                "[guardian] auto-denied permission request action={} reason={}",
+                params.action, guardian_verdict.reason
+            ));
+            PermissionResult::Denied {
+                reason: Some(guardian_verdict.reason),
+            }
+        } else {
+            let system = get_safety_system();
+            system.request_permission(request)
+        };
 
         let output = match result {
             PermissionResult::Approved { ref message } => {
