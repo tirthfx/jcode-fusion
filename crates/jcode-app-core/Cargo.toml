@@ -106,6 +106,14 @@ tar = "0.4"
 tempfile = "3"
 agentgrep = { git = "https://github.com/1jehuang/agentgrep.git", tag = "v0.1.6" }
 
+# Fusion: execpolicy (DESIGN.md item #6) -- Starlark for user-configurable
+# command-risk rules, layered on top of jcode-command-risk's own hardcoded
+# classification rather than added to that crate directly (it's deliberately
+# dependency-free by design, see its own doc comments). A safe, sandboxed
+# config language (no file I/O/network from within a script), the same
+# family used by Bazel/Buck2 -- not a general-purpose scripting risk.
+starlark = "0.14"
+
 [features]
 default = ["pdf", "embeddings", "bedrock"]
 # jemalloc allocator stats live in jcode-base (process_memory); forward there.

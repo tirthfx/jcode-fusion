@@ -31,6 +31,7 @@ pub mod ambient_scheduler;
 pub mod build;
 pub mod catchup;
 pub mod channel;
+pub mod execpolicy;
 pub mod external_auth;
 pub mod guardian;
 pub mod mission;
