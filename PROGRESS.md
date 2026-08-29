@@ -19,7 +19,7 @@
 | Phase | Contents | Status |
 |---|---|---|
 | **0 — Foundation** | Unified Mission Engine (#1) + provable-safe rewind (#4) | **Phase 0 complete.** Mission Engine (4/4 slices) + provable-safe rewind, all tested and pushed. |
-| **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | Not started |
+| **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **In progress** — sandboxing first slice done (see session log). Guardian, execpolicy not started. |
 | **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | Not started |
 | **3 — Ecosystem** | ACP support (#7), orchestration-as-script (#8) | Not started |
 | **4 — Memory** | Two-phase consolidation (#9) | Not started |
@@ -186,10 +186,20 @@ New `crates/jcode-app-core/src/rewind_store.rs`: a persisted, multi-level, integ
 
 **This completes Phase 0 in full** (Mission Engine, 4/4 slices, + provable-safe rewind).
 
+## Phase 1 first slice: whole-process macOS sandboxing — DONE (2026-08-30)
+
+User's decision: whole-process (not helper-process-for-file-tools). New `crates/jcode-app-core/src/sandbox_macos.rs`, wired into `src/main.rs` right before the tokio runtime starts. Opt-in (`JCODE_FUSION_SANDBOX=1`, default off) — re-execs the entire binary under `sandbox-exec` via jcode's own existing `crate::platform::replace_process` utility (reused, not reimplemented). Deliberately conservative: `(allow default)` + `(deny file-write* ...)` against a curated credential/secret path list (`~/.ssh`, `~/.aws`, `~/.docker`, `~/.kube`, etc.) — blast-radius reduction, not a full deny-by-default lockdown (getting that wrong risks breaking the whole app).
+
+**Real bug found and fixed before shipping, not after**: manually verified the deny rule with a raw `sandbox-exec` test first, and it silently did nothing. Root cause: macOS Seatbelt matches `subpath` rules against the *canonicalized* path — `/var/folders/...` (what `mktemp`/`TMPDIR` hand out) is actually a symlink to `/private/var/folders/...`, so a profile built from the symlinked form matches zero real writes. Fixed by canonicalizing `$HOME` before joining protected subpaths (falls back to the raw path if canonicalization fails). Re-verified with the same raw test using the canonical path — deny rule actually blocked the write this time. Added a regression test with a real symlink in a tempdir so this exact bug class can't silently reappear.
+
+**Deliberately did not test against the user's real `~/.ssh`/`~/.aws`/etc.** — even a "should be denied" write attempt against real credential paths isn't a good risk/confidence tradeoff. Verification chain instead: unit-tested canonicalization + manually-proven Seatbelt mechanism (raw `sandbox-exec` runs) + live-tested that `jcode-fusion` actually re-execs under `sandbox-exec` without breaking normal startup (identical behavior sandboxed vs. unsandboxed against an isolated `JCODE_HOME`). 8 new tests, all passing.
+
+**Still open for Phase 1**: Linux (bwrap) sandboxing not started (later, per the macOS-first decision). Guardian and execpolicy not started.
+
 ## Next steps (pick up here)
 
-1. **Phase 0 is fully complete.** Phase 1 (Guardian reviewer, execpolicy, macOS sandboxing) is next.
-2. **Before writing any Phase 1 code, resolve the open decisions already surfaced** (see "Full review pass complete" section above): Guardian's scope (ambient-only vs. general — recommend ambient-only, matches what exists), execpolicy vs. the existing `jcode-command-risk` classifier (recommend extending `jcode-command-risk` with Starlark-configurable rules rather than a parallel system), and the file-edit-tool sandboxing gap (whole-process vs. helper-process — flagged earlier as the one genuinely open question, not yet decided).
+1. **Phase 0 is fully complete.** Phase 1's sandboxing (macOS) first slice is done. Guardian reviewer and execpolicy are next.
+2. **Before writing more Phase 1 code, resolve the remaining open decisions** (see "Full review pass complete" section above): Guardian's scope (ambient-only vs. general — recommend ambient-only, matches what exists), execpolicy vs. the existing `jcode-command-risk` classifier (recommend extending `jcode-command-risk` with Starlark-configurable rules rather than a parallel system), and the file-edit-tool sandboxing gap (whole-process vs. helper-process — flagged earlier as the one genuinely open question, not yet decided).
 3. **Lesson from this slice, apply going forward**: run the *full* `cargo test -p jcode-app-core --lib` (not just a scoped filter) at least once per phase, not just once per slice within a phase — the token-cap regression sat undetected across 3 prior slices because only mission-scoped filters were run. Cheap to check, expensive to accumulate.
 4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login) still hasn't happened for any Phase 0 piece beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
 5. Update this file at the end of every session — status table, session log entry, next steps — before ending.
