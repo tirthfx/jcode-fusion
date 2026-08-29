@@ -19,7 +19,7 @@
 | Phase | Contents | Status |
 |---|---|---|
 | **0 — Foundation** | Unified Mission Engine (#1) + provable-safe rewind (#4) | **Phase 0 complete.** Mission Engine (4/4 slices) + provable-safe rewind, all tested and pushed. |
-| **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **In progress** — sandboxing (macOS) done, Guardian (ambient-scoped, deny-only) done. execpolicy not started. |
+| **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **Phase 1 complete.** Sandboxing (macOS), Guardian (ambient-scoped, deny-only), execpolicy (Starlark, extends jcode-command-risk) all shipped. |
 | **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | Not started |
 | **3 — Ecosystem** | ACP support (#7), orchestration-as-script (#8) | Not started |
 | **4 — Memory** | Two-phase consolidation (#9) | Not started |
@@ -204,12 +204,28 @@ Ambient-scoped, deny-only, per the earlier decision. New `crates/jcode-app-core/
 
 7 new tests, all passing. Ran the full `jcode-app-core` test suite (not just scoped filters, per the lesson from the rewind slice) — 1202 passed, 29 failed, and confirmed the failure count and every individual test name are identical to the last full-suite run — zero new regressions from Guardian. Full binary rebuilds clean.
 
+## Phase 1 final slice: execpolicy (Starlark-configurable command rules) — DONE (2026-08-30)
+
+User's decision: extend `jcode-command-risk`, don't replace it. New `crates/jcode-app-core/src/execpolicy.rs` (new `starlark = "0.14"` dependency, added to `jcode-app-core` — deliberately **not** to `jcode-command-risk` itself, which is zero-dependency by design; see the crate's own doc comments, "not another model"). Wired into `tool/bash_destructive_gate.rs`, checked only after the built-in classifier already returned `Allow` — user rules can only escalate (`Confirm`/`Deny`), structurally cannot downgrade an existing built-in restriction.
+
+Rule format is deliberately simple: `"prefix|decision|reason"` strings in a `RULES` list, not Starlark dicts — used only the `starlark` crate's list/string APIs (the parts gotten right confidently), not dict-introspection or native-function registration. The *script* itself is still real Starlark — a test proves a list comprehension can generate the `RULES` list programmatically.
+
+**One real API-guessing miss, caught and fixed properly, not shipped blind**: `Module::new()` doesn't exist in `starlark` 0.14 — found the actual vendored crate source on disk and confirmed the real API is closure-based (`Module::with_temp_heap(|module| {...})`), fixed it, rebuilt clean. Everything else (`ListRef::from_value`, `unpack_str`, `module.get`) was correct on the first attempt (also verified against source, not assumed).
+
+**Two honest gaps, documented not hidden**:
+1. `UserDecision::Confirm` and `Deny` currently behave identically (unconditional refusal) — no resubmit-with-justification retry flow for user rules yet, unlike the built-in classifier's own `Confirm`.
+2. The `OnceLock` caching wrapper isn't independently integration-tested (process-global state can't cleanly reset between tests sharing one binary) — the pure logic underneath is fully covered by 10 new tests. Also couldn't live-test the full bash-tool path via an example binary the way mission/sandboxing were, since `bash` is a private module and making it `pub` just for a test felt like a broader change than warranted.
+
+Full test suite: 1212 passed, 29 failed — confirmed identical (count and every test name) to the prior baseline. Zero regressions. Full binary rebuilds clean.
+
+**This completes Phase 1** — sandboxing, Guardian, and execpolicy all shipped.
+
 ## Next steps (pick up here)
 
-1. **Phase 0 is fully complete. Phase 1: sandboxing (macOS) done, Guardian done.** execpolicy (#6) is the last piece of Phase 1.
-2. **Only one open decision left for Phase 1**: execpolicy (#6) vs. the existing `jcode-command-risk` classifier — recommend extending `jcode-command-risk` with Starlark-configurable rules rather than a parallel system (still just a recommendation, not locked in by the user yet). Guardian's scope and sandboxing's scope are both resolved and shipped now.
-3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` (not just a scoped filter) after every slice that touches shared infrastructure — cheap to check, expensive to accumulate. Done for both the sandboxing and Guardian slices; keep doing it.
-4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login) still hasn't happened for any Phase 0/1 piece beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
+1. **Phases 0 and 1 are both fully complete.** Phase 2 (worktree-per-subagent swarm isolation, #2) is next per DESIGN.md's roadmap.
+2. **Remaining follow-up work, not blocking, but real** (documented across Phase 1's slices): Guardian's auto-approve half (needs a real semantic judge), Linux/Windows sandboxing, execpolicy's resubmit-with-justification flow for user rules. None of these block starting Phase 2.
+3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` after every slice that touches shared infrastructure. Done consistently for sandboxing/Guardian/execpolicy — keep doing it for Phase 2.
+4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login) still hasn't happened for any piece beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
 5. Update this file at the end of every session — status table, session log entry, next steps — before ending.
 
 ## Housekeeping reminder
