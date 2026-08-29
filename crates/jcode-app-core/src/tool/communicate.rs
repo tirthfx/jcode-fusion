@@ -298,6 +298,68 @@ async fn cleanup_swarm_workers(ctx: &ToolContext, params: &CommunicateInput) -> 
     Ok(stop_swarm_sessions(ctx, candidates, force).await.describe())
 }
 
+/// Phase 2 merge-back: apply one swarm worker's Fusion-managed worktree
+/// branch into this session's own tree. Deliberately targets exactly one
+/// member per call, on explicit request -- unlike `cleanup`, there is no
+/// bulk/"all eligible members" mode, since whether a worker's work is
+/// "done enough" to merge is a judgment call, not a status-based filter.
+///
+/// Runs entirely in-process: `fetch_swarm_members` (below) already scopes
+/// its result to the caller's own swarm, so a `target_session` that isn't
+/// in that list is rejected as an ownership check, not just a lookup miss.
+/// The actual git work happens locally via `swarm_worktree` -- no new
+/// server `Request`/`ServerEvent` pair, since the tool call already runs
+/// in the same process as `SwarmState`.
+async fn apply_worktree_merge(ctx: &ToolContext, params: &CommunicateInput) -> Result<String> {
+    let target = params
+        .target_session
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("'target_session' is required for apply action"))?;
+
+    let members = fetch_swarm_members(&ctx.session_id).await?;
+    let member = members.iter().find(|m| m.session_id == target).ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{}' is not a member of this swarm (or does not exist) -- cannot merge",
+            target
+        )
+    })?;
+
+    let worktree_path = member.worktree_path.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{}' has no Fusion-managed worktree to merge. Either JCODE_FUSION_SWARM_WORKTREES \
+             was off when it was spawned, or it already shares this session's own working \
+             directory -- there is nothing to apply.",
+            target
+        )
+    })?;
+
+    let session_dir = ctx
+        .working_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("this session has no working directory to merge into"))?;
+    let repo_root = crate::swarm_worktree::resolve_repo_root(&session_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not resolve this session's own repo root: {e}"))?;
+
+    match crate::swarm_worktree::merge_worktree_branch(&repo_root, &worktree_path).await {
+        Ok(crate::swarm_worktree::MergeOutcome::Merged { commit_sha }) => Ok(format!(
+            "Merged {}'s worktree branch into {} as {}.",
+            target,
+            repo_root.display(),
+            &commit_sha[..commit_sha.len().min(12)]
+        )),
+        Ok(crate::swarm_worktree::MergeOutcome::Conflict { files }) => Ok(format!(
+            "Merge conflict applying {}'s worktree branch -- aborted, {} left exactly as it was. \
+             Conflicting file(s): {}. Ask {} to resolve and recommit, then retry `apply`.",
+            target,
+            repo_root.display(),
+            files.join(", "),
+            target
+        )),
+        Err(e) => Err(anyhow::anyhow!("Failed to merge {}'s worktree: {}", target, e)),
+    }
+}
+
 /// Result of stopping a batch of swarm sessions: which stops succeeded and
 /// which failed (with reasons). Split from the human-readable formatting so
 /// callers like the mid-run capacity recovery can count freed slots.
@@ -1938,6 +2000,7 @@ fn canonical_swarm_action(action: &str) -> &str {
         "plan" | "status_plan" => "plan_status",
         "assign" => "assign_task",
         "kill" | "terminate" => "stop",
+        "merge" | "merge_back" | "apply_worktree" => "apply",
         _ => action,
     }
 }
@@ -1962,11 +2025,11 @@ impl Tool for CommunicateTool {
                     "type": "string",
                     "enum": ["share", "share_append", "read", "message", "broadcast", "dm", "channel", "list", "list_channels", "channel_members",
                              "propose_plan", "approve_plan", "reject_plan", "spawn", "stop", "assign_role",
-                             "status", "report", "plan_status", "summary", "read_context", "resync_plan", "assign_task", "assign_next", "fill_slots", "run_plan", "cleanup",
+                             "status", "report", "plan_status", "summary", "read_context", "resync_plan", "assign_task", "assign_next", "fill_slots", "run_plan", "cleanup", "apply",
                              "task_graph", "expand_node", "complete_node", "inject_gap",
                              "start", "start_task", "wake", "resume", "retry", "reassign", "replace", "salvage",
                              "subscribe_channel", "unsubscribe_channel", "await_members", "list_models"],
-                    "description": "Action. spawn requires label and should include prompt. list_models shows available models/routes."
+                    "description": "Action. spawn requires label and prompt. apply merges a worktree branch, needs target_session."
                 },
                 "key": {
                     "type": "string",
@@ -2798,6 +2861,10 @@ impl Tool for CommunicateTool {
             }
 
             "cleanup" => cleanup_swarm_workers(&ctx, &params)
+                .await
+                .map(ToolOutput::new),
+
+            "apply" => apply_worktree_merge(&ctx, &params)
                 .await
                 .map(ToolOutput::new),
 

@@ -272,6 +272,7 @@ fn format_members_renders_activity_progress_churn_and_turns() {
             cumulative_total_tokens: Some(98_765),
             todos_completed: Some(3),
             todos_total: Some(7),
+            worktree_path: None,
         }],
     );
 

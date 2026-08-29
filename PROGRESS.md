@@ -20,7 +20,7 @@
 |---|---|---|
 | **0 — Foundation** | Unified Mission Engine (#1) + provable-safe rewind (#4) | **Phase 0 complete.** Mission Engine (4/4 slices) + provable-safe rewind, all tested and pushed. |
 | **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **Phase 1 complete.** Sandboxing (macOS), Guardian (ambient-scoped, deny-only), execpolicy (Starlark, extends jcode-command-risk) all shipped. |
-| **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | **In progress** — creation + cleanup both done. Merge-back is the last piece. |
+| **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | **Phase 2 complete.** Creation + cleanup + merge-back all shipped. |
 | **3 — Ecosystem** | ACP support (#7), orchestration-as-script (#8) | Not started |
 | **4 — Memory** | Two-phase consolidation (#9) | Not started |
 
@@ -242,15 +242,30 @@ Fire-and-forget (`tokio::spawn`) so a slow `git` call never blocks the pruning s
 
 3 new tests. Full `swarm_worktree` suite: 12/12. Touched `server.rs`'s core pruning logic directly — ran the full suite: 1224 passed, 29 failed, identical to the established baseline. Zero regressions.
 
-**Phase 2 status: creation ✅, cleanup ✅, merge-back ⬜ (the last piece).**
+**Phase 2 status: creation ✅, cleanup ✅, merge-back ✅ — Phase 2 complete.**
+
+## Phase 2 third slice: worktree merge-back — DONE (2026-08-30, Session 2)
+
+Closed the last piece of Phase 2: applying a worker's Fusion-managed worktree branch back into the coordinator's tree, on explicit request only (Grok Build's own "apply" pattern, never automatic).
+
+- **`crates/jcode-protocol/src/lib.rs`**: `AgentInfo` gained `worktree_path: Option<PathBuf>` — populated server-side (`server/client_comm_context.rs::handle_comm_list`) only when the member's `working_dir` passes `swarm_worktree::is_managed_worktree_path()`, so an ordinary shared directory can never be mistaken for something safe to merge against.
+- **`swarm_worktree.rs`**: three new primitives — `branch_name_for_worktree` (pure inverse of `create_worktree`'s own naming), `worktree_is_clean` (`git status --porcelain`), and `merge_worktree_branch` (`MergeOutcome::{Merged, Conflict}`). Merges are always `--no-ff` (explicit merge commit, never indistinguishable from the coordinator's own history); a dirty worktree is refused before git ever runs; a conflicted merge is unconditionally `git merge --abort`ed before returning, so the coordinator's tree is never left mid-merge.
+- **`tool/communicate.rs`**: new `apply` action on the `swarm` tool (aliases `merge`/`merge_back`/`apply_worktree`), takes `target_session`. Runs entirely in-process — no new server `Request`/`ServerEvent` pair — since tool execution already shares a process with `SwarmState`; `fetch_swarm_members` already scopes to the caller's own swarm, so a `target_session` outside it is rejected as an ownership check, not just a lookup miss.
+- **Deliberately not done**: no automatic conflict resolution (reported back as text, a human or follow-up turn handles it), no automatic worktree/branch deletion after a successful merge (the existing terminal-member pruning sweep from the cleanup slice already handles the worktree once the member goes terminal; the branch ref is left behind, same as `remove_worktree`'s own documented behavior), no support for targeting anything other than whatever the coordinator currently has checked out.
+- **Real, thorough testing** — 7 new tests in `swarm_worktree.rs`, all against real `git` operations, not mocks: branch-name derivation round-trips through an actual `create_worktree()` call; a dirty worktree is refused and the coordinator's tree is confirmed untouched; a clean commit merges and the coordinator's own working tree gets the file; a genuine conflicting edit on both sides produces `Conflict` *and* the repo is verified to have zero `MERGE_HEAD`/unmerged state afterward; a nonexistent branch fails cleanly.
+- **One real regression caught and fixed before it shipped, not after**: adding the `apply` blurb to the `swarm` tool's `action` parameter description initially broke both `tool_parameter_descriptions_stay_under_token_cap` (pushed to ~47 tokens, over the 25 cap) and a pre-existing test asserting the description's exact wording (`schema_requires_a_nonblank_label_for_spawn`, which checks for the substring "spawn requires label"). Trimmed to `"Action. spawn requires label and prompt. apply merges a worktree branch, needs target_session."` (~19 tokens) — keeps the substring the old test depends on, stays under cap.
+- Full `cargo test -p jcode-app-core --lib`: **1231 passed, 29 failed** — confirmed via `git stash`/re-run that all 29 are the standing pre-existing baseline (including the 4 known-flaky `communicate_*` end-to-end timing tests, reproduced identically with and without this slice's changes). Zero regressions. Full `jcode-fusion` binary rebuilds clean, zero new warnings.
+
+**This completes Phase 2 in full** (worktree-per-subagent isolation: creation, cleanup, merge-back).
 
 ## Next steps (pick up here)
 
-1. **Merge-back is the only piece left in Phase 2.** Applying a worker's worktree branch back into the coordinator's tree — genuinely more involved than creation/cleanup (real git merge-conflict handling, deciding when a worker is "done" enough to merge), and risks losing a worker's actual work if rushed. Grok Build's own pattern (an explicit "apply" step, not automatic) is the model to follow.
+1. **Phase 2 is done.** Phases 3 (ACP gaps, orchestration-as-script) and 4 (memory consolidation) haven't been started — see the source-level findings sections above for what's already scoped.
 2. **Remaining follow-up work from Phase 1, not blocking**: Guardian's auto-approve half (needs a real semantic judge), Linux/Windows sandboxing, execpolicy's resubmit-with-justification flow for user rules.
-3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` after every slice that touches shared infrastructure — done consistently through both worktree slices, caught nothing new either time (good sign, not a reason to stop checking).
-4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login, and specifically trying `JCODE_FUSION_SWARM_WORKTREES=1` with a real swarm spawn) still hasn't happened beyond the very first slice's example-based demo — this remains the single biggest unverified assumption in the whole project. Worth prioritizing over further slices at some point.
-5. Update this file at the end of every session — status table, session log entry, next steps — before ending. **Also update `claude-code-build/SESSION_1_MEMORY.md` if this becomes a new session** — that file is a point-in-time debrief, not a living doc; a Session 2 should either update it or add a `SESSION_2_MEMORY.md` alongside it, not silently let it go stale.
+3. **Follow-up from this slice, not blocking**: no automated conflict-resolution path yet (a conflict just gets reported back as text); merged worktrees/branches aren't proactively cleaned up beyond the existing terminal-member sweep picking up the worktree — a leftover `jcode-swarm/*` branch ref after a successful merge is harmless but will accumulate over time, worth a cheap follow-up.
+4. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` after every slice that touches shared infrastructure — done consistently through all three worktree slices now, caught real issues twice (the token-cap regression here, the original tool-description cap violation in Phase 0).
+5. Manual/live TUI verification (running `jcode-fusion` interactively with a real login, and specifically trying `JCODE_FUSION_SWARM_WORKTREES=1` with a real swarm spawn, then a real `apply` call) still hasn't happened beyond example-based/unit-level demos — this remains the single biggest unverified assumption in the whole project. Worth prioritizing over further phases at some point.
+6. Update this file at the end of every session — status table, session log entry, next steps — before ending. Session 2 will also write `claude-code-build/SESSION_2_MEMORY.md` alongside `SESSION_1_MEMORY.md` before ending, not silently let it go stale.
 
 ## Housekeeping reminder
 `jcode-fusion/jcode/target/` is already 4.8GB after one debug build — same kind of build-cache directory that ballooned to 4.9GB in the user's real `~/.jcode/scratch/`. It's safe to `rm -rf target/` any time disk gets tight; nothing of value lives there. Keep an eye on it periodically so this fork doesn't silently repeat that problem long-term.

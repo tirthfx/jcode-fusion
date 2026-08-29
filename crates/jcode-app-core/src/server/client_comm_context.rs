@@ -250,6 +250,7 @@ pub(super) async fn handle_comm_list(
             latest_completion_report: Option<String>,
             live_attachments: usize,
             status_age_secs: u64,
+            worktree_path: Option<std::path::PathBuf>,
         }
 
         let statics: Vec<MemberStatic> = {
@@ -266,6 +267,14 @@ pub(super) async fn handle_comm_list(
                             .map(|path| path.display().to_string())
                             .collect();
                         files.sort();
+                        // Only surface a worktree_path when it's actually one of
+                        // ours (Phase 2, `swarm_worktree.rs`) -- an arbitrary
+                        // shared working_dir must never be mistaken by a client
+                        // action (e.g. merge-back) for something safe to `git
+                        // merge` against.
+                        let worktree_path = member.working_dir.clone().filter(|path| {
+                            crate::swarm_worktree::is_managed_worktree_path(path)
+                        });
                         MemberStatic {
                             session_id: sid.clone(),
                             friendly_name: member.friendly_name.clone(),
@@ -279,6 +288,7 @@ pub(super) async fn handle_comm_list(
                             latest_completion_report: member.latest_completion_report.clone(),
                             live_attachments: member.event_txs.len(),
                             status_age_secs: member.last_status_change.elapsed().as_secs(),
+                            worktree_path,
                         }
                     })
                 })
@@ -319,6 +329,7 @@ pub(super) async fn handle_comm_list(
                 cumulative_total_tokens: extras.cumulative_total_tokens,
                 todos_completed: extras.todos_completed,
                 todos_total: extras.todos_total,
+                worktree_path: m.worktree_path,
             });
         }
 

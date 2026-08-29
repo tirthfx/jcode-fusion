@@ -7,6 +7,8 @@
 //! - Main socket: TUI/client communication with agent
 //! - Agent socket: Inter-agent communication (AI-to-AI)
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 mod comm_format;
@@ -270,6 +272,14 @@ pub struct AgentInfo {
     /// Total number of todos for this agent's session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todos_total: Option<usize>,
+    /// Path to this member's Fusion-managed swarm worktree (Phase 2,
+    /// `swarm_worktree.rs`), if it has one. Deliberately **not** the same
+    /// thing as an arbitrary `working_dir` — only populated when the
+    /// server-side value passes `swarm_worktree::is_managed_worktree_path()`,
+    /// so a client-side action (e.g. merge-back) can trust its mere presence
+    /// as "safe to treat as a worktree" without re-deriving that check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
 }
 
 /// Lightweight status snapshot for a swarm member.

@@ -178,6 +178,182 @@ pub fn is_managed_worktree_path(path: &Path) -> bool {
     canonical_path.starts_with(&canonical_managed_root)
 }
 
+/// The outcome of attempting to merge a worker's worktree branch back into
+/// the coordinator's tree. Deliberately only two variants: a merge either
+/// lands cleanly or it doesn't. A conflicted attempt is always aborted
+/// before this returns (see [`merge_worktree_branch`]) -- there is no
+/// "merged with conflicts left for you to resolve" state, since that would
+/// mean handing back a repo in a half-merged condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The branch merged cleanly. `commit_sha` is the new merge commit.
+    Merged { commit_sha: String },
+    /// The merge produced conflicts and was aborted -- the repo is back to
+    /// exactly the state it was in before the merge was attempted.
+    /// `files` lists the conflicting paths, for the caller to act on
+    /// (e.g. ask the worker to resolve and recommit, or route to a human).
+    Conflict { files: Vec<String> },
+}
+
+/// Derive the `jcode-swarm/<label>` branch name [`create_worktree`] created
+/// for a given worktree, from the worktree's own directory name -- mirrors
+/// `path = root.join(worker_label)` in [`create_worktree`] exactly, so this
+/// is a pure inverse of that, not a separate convention to keep in sync by
+/// hand.
+pub fn branch_name_for_worktree(worktree_path: &Path) -> Option<String> {
+    let label = worktree_path.file_name()?.to_str()?;
+    Some(format!("jcode-swarm/{label}"))
+}
+
+/// True if the worktree has no uncommitted changes (staged, unstaged, or
+/// untracked). Merging a dirty worktree would silently leave that work
+/// behind -- git only ever merges what's committed -- so callers must
+/// check this *before* attempting a merge, not discover it after the fact.
+pub async fn worktree_is_clean(worktree_path: &Path) -> anyhow::Result<bool> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout.is_empty())
+}
+
+/// List the conflicting paths from a merge currently in progress (`git
+/// status --porcelain` marks unmerged entries with a `U` in either column,
+/// plus the `AA`/`DD` both-added/both-deleted cases). Used only to build a
+/// [`MergeOutcome::Conflict`] report before the merge is aborted.
+async fn list_conflicted_paths(repo_root: &Path) -> anyhow::Result<Vec<String>> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .await?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut files: Vec<String> = text
+        .lines()
+        .filter(|line| {
+            let status = line.get(0..2).unwrap_or("");
+            matches!(status, "UU" | "AA" | "DD" | "AU" | "UA" | "DU" | "UD")
+        })
+        .filter_map(|line| line.get(3..).map(|s| s.to_string()))
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// Merge a worker's worktree branch into `repo_root`'s currently checked
+/// out branch. **Refuses (does not attempt) if the worktree has
+/// uncommitted changes** -- see [`worktree_is_clean`]; that check must run
+/// before this is called, and this function re-checks it itself rather
+/// than trusting the caller, since silently merging past a dirty worktree
+/// is exactly the kind of mistake this module exists to prevent.
+///
+/// Always merges with `--no-ff`: a merge commit is created even when a
+/// fast-forward would be possible, so the resulting history always
+/// explicitly records that a swarm worker's branch was applied here,
+/// rather than looking indistinguishable from the coordinator's own
+/// commits.
+///
+/// On conflict, the merge is unconditionally aborted (`git merge --abort`)
+/// before returning -- the coordinator's tree is never left mid-merge.
+/// Verified by this module's own tests, not just assumed: a conflicting
+/// merge attempt is followed by a real `git status` check confirming no
+/// `MERGE_HEAD` / unmerged state remains.
+pub async fn merge_worktree_branch(
+    repo_root: &Path,
+    worktree_path: &Path,
+) -> anyhow::Result<MergeOutcome> {
+    if !worktree_is_clean(worktree_path).await? {
+        anyhow::bail!(
+            "worktree at {} has uncommitted changes -- commit or discard them before merging",
+            worktree_path.display()
+        );
+    }
+
+    let branch = branch_name_for_worktree(worktree_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not derive a branch name from worktree path {}",
+            worktree_path.display()
+        )
+    })?;
+
+    let verify = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .await?;
+    if !verify.status.success() {
+        anyhow::bail!("branch '{branch}' does not exist in {}", repo_root.display());
+    }
+
+    let merge = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("merge")
+        .arg("--no-ff")
+        .arg("-m")
+        .arg(format!("Merge swarm worker branch '{branch}' (jcode-fusion merge-back)"))
+        .arg(&branch)
+        .output()
+        .await?;
+
+    if merge.status.success() {
+        let sha_output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("rev-parse")
+            .arg("HEAD")
+            .output()
+            .await?;
+        let commit_sha = String::from_utf8_lossy(&sha_output.stdout).trim().to_string();
+        return Ok(MergeOutcome::Merged { commit_sha });
+    }
+
+    // Conflict (or some other merge failure) -- collect what we can, then
+    // unconditionally abort so the repo never sits mid-merge.
+    let files = list_conflicted_paths(repo_root).await.unwrap_or_default();
+    let abort = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("merge")
+        .arg("--abort")
+        .output()
+        .await;
+    if let Err(e) = abort {
+        anyhow::bail!(
+            "merge of '{branch}' failed and `git merge --abort` itself could not run ({e}) -- \
+             repo at {} may be left mid-merge, needs manual attention",
+            repo_root.display()
+        );
+    }
+
+    if files.is_empty() {
+        // Merge failed for a reason that wasn't a content conflict (e.g. a
+        // local pre-merge hook rejected it). Surface the real stderr rather
+        // than reporting a misleading empty conflict list.
+        anyhow::bail!(
+            "git merge failed and was aborted: {}",
+            String::from_utf8_lossy(&merge.stderr).trim()
+        );
+    }
+
+    Ok(MergeOutcome::Conflict { files })
+}
+
 /// Cleanup entry point: remove a worktree using only its own path, no
 /// separately-tracked repo root needed. **Verified this actually works**
 /// (not assumed): `git worktree remove` operates on repo-wide state shared
@@ -398,5 +574,192 @@ mod tests {
             .await
             .expect("remove");
         assert!(!worktree_path.exists());
+    }
+
+    /// Run a git command in `dir`, panicking with stderr on failure --
+    /// shared by the merge-back tests below, which (unlike the tests
+    /// above) need to run *more* than one git command per test to set up
+    /// real divergent history.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_name_for_worktree_matches_what_create_worktree_actually_made() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-branch-name")
+            .await
+            .expect("create");
+        let branch = branch_name_for_worktree(&worktree_path).expect("derive branch name");
+        assert_eq!(branch, "jcode-swarm/worker-branch-name");
+
+        // Not just string-shaped -- the branch this names must actually exist.
+        let verify = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg(format!("refs/heads/{branch}"))
+            .output()
+            .expect("git rev-parse");
+        assert!(verify.status.success());
+    }
+
+    #[tokio::test]
+    async fn worktree_is_clean_true_for_an_untouched_worktree() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-clean")
+            .await
+            .expect("create");
+        assert!(worktree_is_clean(&worktree_path).await.expect("check"));
+    }
+
+    #[tokio::test]
+    async fn worktree_is_clean_false_after_an_uncommitted_edit() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-dirty")
+            .await
+            .expect("create");
+        std::fs::write(worktree_path.join("scratch.txt"), "not committed\n").expect("write");
+        assert!(!worktree_is_clean(&worktree_path).await.expect("check"));
+    }
+
+    #[tokio::test]
+    async fn merge_worktree_branch_refuses_when_the_worktree_is_dirty() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-dirty-merge")
+            .await
+            .expect("create");
+        std::fs::write(worktree_path.join("scratch.txt"), "not committed\n").expect("write");
+
+        let result = merge_worktree_branch(repo.path(), &worktree_path).await;
+        assert!(result.is_err(), "must refuse to merge a dirty worktree");
+
+        // And must not have touched the coordinator's tree at all.
+        assert!(!repo.path().join("scratch.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn merge_worktree_branch_merges_a_clean_commit() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-good-merge")
+            .await
+            .expect("create");
+        std::fs::write(worktree_path.join("feature.txt"), "worker's work\n").expect("write");
+        git_ok(&worktree_path, &["add", "."]);
+        git_ok(&worktree_path, &["commit", "-q", "-m", "worker: add feature.txt"]);
+
+        let outcome = merge_worktree_branch(repo.path(), &worktree_path)
+            .await
+            .expect("merge should succeed");
+        match outcome {
+            MergeOutcome::Merged { commit_sha } => assert!(!commit_sha.is_empty()),
+            other => panic!("expected Merged, got {other:?}"),
+        }
+
+        // The coordinator's own working tree must now actually have it.
+        assert!(repo.path().join("feature.txt").exists());
+        let contents = std::fs::read_to_string(repo.path().join("feature.txt")).expect("read");
+        assert_eq!(contents, "worker's work\n");
+    }
+
+    #[tokio::test]
+    async fn merge_worktree_branch_conflict_leaves_the_repo_clean() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-conflict")
+            .await
+            .expect("create");
+
+        // Diverge: the coordinator's own tree changes the same line...
+        std::fs::write(repo.path().join("README.md"), "coordinator's version\n")
+            .expect("write coordinator side");
+        git_ok(repo.path(), &["add", "."]);
+        git_ok(repo.path(), &["commit", "-q", "-m", "coordinator: edit README"]);
+
+        // ...and so does the worker, on its own branch.
+        std::fs::write(worktree_path.join("README.md"), "worker's version\n")
+            .expect("write worker side");
+        git_ok(&worktree_path, &["add", "."]);
+        git_ok(&worktree_path, &["commit", "-q", "-m", "worker: edit README"]);
+
+        let outcome = merge_worktree_branch(repo.path(), &worktree_path)
+            .await
+            .expect("merge call itself should not error on a conflict");
+        let files = match outcome {
+            MergeOutcome::Conflict { files } => files,
+            other => panic!("expected Conflict, got {other:?}"),
+        };
+        assert_eq!(files, vec!["README.md".to_string()]);
+
+        // The repo must be left exactly as if no merge had been attempted:
+        // no leftover MERGE_HEAD, no dirty/unmerged state, and the
+        // coordinator's own pre-merge content is still there untouched.
+        assert!(!repo.path().join(".git").join("MERGE_HEAD").exists());
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .arg("status")
+            .arg("--porcelain")
+            .output()
+            .expect("git status");
+        assert!(
+            status.stdout.is_empty(),
+            "repo must be clean after an aborted merge, got: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        let readme = std::fs::read_to_string(repo.path().join("README.md")).expect("read");
+        assert_eq!(readme, "coordinator's version\n");
+    }
+
+    #[tokio::test]
+    async fn merge_worktree_branch_fails_cleanly_when_the_branch_does_not_exist() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        // A directory that merely *looks* like a worktree path (right
+        // basename shape) but was never actually created via
+        // create_worktree -- its derived branch genuinely doesn't exist.
+        let fake_worktree = repo.path().join("not-a-real-worktree");
+        std::fs::create_dir_all(&fake_worktree).expect("mkdir");
+
+        let result = merge_worktree_branch(repo.path(), &fake_worktree).await;
+        assert!(result.is_err());
     }
 }
