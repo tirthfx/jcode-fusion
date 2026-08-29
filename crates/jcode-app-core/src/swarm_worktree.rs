@@ -160,6 +160,52 @@ pub async fn create_worktree_for_spawn(
     create_worktree(&repo_root, &label).await
 }
 
+/// True if `path` lives under this module's own worktree storage root
+/// (`~/.jcode/worktrees/`) — the way the cleanup sweep (below) tells "this
+/// member's working_dir is a worktree we created" from "this is an ordinary
+/// shared directory we must never touch." A simple path-prefix check rather
+/// than a new field on `SwarmMember`, deliberately: adding a field would
+/// touch that struct's definition and persistence format, a much larger
+/// change than warranted for this.
+pub fn is_managed_worktree_path(path: &Path) -> bool {
+    let Ok(jcode_dir) = crate::storage::jcode_dir() else {
+        return false;
+    };
+    let managed_root = jcode_dir.join("worktrees");
+    let canonical_managed_root =
+        std::fs::canonicalize(&managed_root).unwrap_or(managed_root);
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical_path.starts_with(&canonical_managed_root)
+}
+
+/// Cleanup entry point: remove a worktree using only its own path, no
+/// separately-tracked repo root needed. **Verified this actually works**
+/// (not assumed): `git worktree remove` operates on repo-wide state shared
+/// via the main `.git` directory, so invoking it with `-C <worktree>`
+/// pointed at the worktree itself is sufficient — confirmed by hand with a
+/// real `git worktree add` + `git -C <worktree> worktree remove <worktree>`
+/// before writing this. `SwarmMember` only stores `working_dir` (the
+/// worktree path), not the original repo root, so this self-contained form
+/// is what the cleanup sweep actually needs.
+pub async fn remove_worktree_self_contained(worktree_path: &Path) -> anyhow::Result<()> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .arg("worktree")
+        .arg("remove")
+        .arg(worktree_path)
+        .arg("--force")
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git worktree remove (self-contained) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +332,54 @@ mod tests {
 
         let result = create_worktree_for_spawn(not_a_repo.path(), "swarm-y").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn is_managed_worktree_path_recognizes_our_own_worktrees() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-managed-check")
+            .await
+            .expect("create");
+        assert!(is_managed_worktree_path(&worktree_path));
+    }
+
+    #[tokio::test]
+    async fn is_managed_worktree_path_rejects_ordinary_directories() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let ordinary_dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(
+            !is_managed_worktree_path(ordinary_dir.path()),
+            "an arbitrary directory (e.g. a real shared working_dir) must never be \
+             mistaken for a worktree this module created"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_self_contained_needs_only_the_worktree_path() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        let worktree_path = create_worktree(repo.path(), "worker-self-remove")
+            .await
+            .expect("create");
+        assert!(worktree_path.exists());
+
+        // No repo_root passed anywhere -- this is the whole point of the
+        // "self-contained" variant, matching what the cleanup sweep will
+        // actually have available (SwarmMember only stores working_dir).
+        remove_worktree_self_contained(&worktree_path)
+            .await
+            .expect("self-contained remove");
+        assert!(!worktree_path.exists());
     }
 
     #[tokio::test]

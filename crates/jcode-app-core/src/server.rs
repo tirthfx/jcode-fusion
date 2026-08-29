@@ -168,23 +168,49 @@ async fn prune_expired_terminal_swarm_members(
         if live_sessions.contains(&session_id) || sessions.read().await.contains_key(&session_id) {
             continue;
         }
-        let removed_swarm_id = {
+        let (removed_swarm_id, removed_working_dir) = {
             let mut members = swarm_state.members.write().await;
             let still_expired = members.get(&session_id).is_some_and(|member| {
                 swarm::member_status_is_terminal(&member.status)
                     && member.last_status_change.elapsed() >= retention
             });
             if still_expired {
-                members
-                    .remove(&session_id)
-                    .and_then(|member| member.swarm_id)
+                match members.remove(&session_id) {
+                    Some(member) => (member.swarm_id, member.working_dir),
+                    None => (None, None),
+                }
             } else {
-                None
+                (None, None)
             }
         };
         let Some(swarm_id) = removed_swarm_id else {
             continue;
         };
+
+        // Fusion Phase 2: worktree cleanup, second half of the isolation
+        // feature (creation shipped separately). Fire-and-forget so a slow
+        // `git worktree remove` never blocks the pruning sweep itself --
+        // only ever touches paths this project itself created
+        // (`is_managed_worktree_path`), never an ordinary shared
+        // working_dir. Fails silently-but-logged on error: a worktree left
+        // behind is disk usage to clean up later, not a correctness issue,
+        // so it must not disrupt the member-pruning sweep around it.
+        if let Some(working_dir) = removed_working_dir
+            && crate::swarm_worktree::is_managed_worktree_path(&working_dir)
+        {
+            let session_id_for_log = session_id.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    crate::swarm_worktree::remove_worktree_self_contained(&working_dir).await
+                {
+                    crate::logging::warn(&format!(
+                        "[swarm-worktree] cleanup failed for terminal member \
+                         session_id={session_id_for_log} path={}: {err}",
+                        working_dir.display()
+                    ));
+                }
+            });
+        }
 
         remove_session_from_swarm(
             &session_id,
