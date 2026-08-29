@@ -20,7 +20,7 @@
 |---|---|---|
 | **0 — Foundation** | Unified Mission Engine (#1) + provable-safe rewind (#4) | **Phase 0 complete.** Mission Engine (4/4 slices) + provable-safe rewind, all tested and pushed. |
 | **1 — Safety** | Guardian reviewer (#3), execpolicy (#6), macOS sandboxing first (#5) | **Phase 1 complete.** Sandboxing (macOS), Guardian (ambient-scoped, deny-only), execpolicy (Starlark, extends jcode-command-risk) all shipped. |
-| **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | **In progress** — creation slice done. Merge-back and cleanup not started. |
+| **2 — Swarm rework** | Worktree-per-subagent isolation (#2) | **In progress** — creation + cleanup both done. Merge-back is the last piece. |
 | **3 — Ecosystem** | ACP support (#7), orchestration-as-script (#8) | Not started |
 | **4 — Memory** | Two-phase consolidation (#9) | Not started |
 
@@ -230,13 +230,27 @@ New `crates/jcode-app-core/src/swarm_worktree.rs`, wired into `server/comm_sessi
 
 This touched core swarm spawn code directly (`comm_session.rs`), not just a new isolated module — ran the full test suite as a result: 1221 passed, 29 failed, confirmed identical (count and every test name) to the established baseline, including confirming `comm_session`'s own `prepare_visible_spawn_session_*` tests were *already* in that pre-existing failure list before this change touched the file. Zero regressions. Full binary rebuilds clean.
 
+## Phase 2 second slice: worktree cleanup — DONE (2026-08-30)
+
+Wired into jcode's **existing** terminal-member pruning sweep (`server.rs::prune_expired_terminal_swarm_members`, already runs periodically via `swarm_terminal_member_gc_interval`) rather than inventing new scheduling — when a terminal member's retention window expires and gets pruned, its worktree (if it has one) is removed in the same pass.
+
+**How it tells "has a worktree" from "ordinary shared dir"**: `swarm_worktree::is_managed_worktree_path()` — a path-prefix check against `~/.jcode/worktrees/`, deliberately not a new field on `SwarmMember` (would touch that struct's definition and persistence format, a much bigger change than warranted).
+
+**A git assumption verified by hand before relying on it**: `SwarmMember` only stores `working_dir` (the worktree path), not the original repo root. Confirmed with a real `git worktree add` + `git -C <worktree> worktree remove <worktree>` that removal works self-contained from just the worktree's own path — git worktree commands operate on repo-wide state shared via the main `.git` directory.
+
+Fire-and-forget (`tokio::spawn`) so a slow `git` call never blocks the pruning sweep; failures are logged, not disruptive (a leftover worktree is disk usage to deal with later, not a correctness issue).
+
+3 new tests. Full `swarm_worktree` suite: 12/12. Touched `server.rs`'s core pruning logic directly — ran the full suite: 1224 passed, 29 failed, identical to the established baseline. Zero regressions.
+
+**Phase 2 status: creation ✅, cleanup ✅, merge-back ⬜ (the last piece).**
+
 ## Next steps (pick up here)
 
-1. **Phase 2's creation slice is done.** Next: either merge-back (apply a worker's worktree branch back into the coordinator's tree) or cleanup (remove abandoned worktrees) — both genuinely more involved than creation, and both risk losing a worker's actual work if gotten wrong, so pick whichever gets scoped carefully rather than rushed.
+1. **Merge-back is the only piece left in Phase 2.** Applying a worker's worktree branch back into the coordinator's tree — genuinely more involved than creation/cleanup (real git merge-conflict handling, deciding when a worker is "done" enough to merge), and risks losing a worker's actual work if rushed. Grok Build's own pattern (an explicit "apply" step, not automatic) is the model to follow.
 2. **Remaining follow-up work from Phase 1, not blocking**: Guardian's auto-approve half (needs a real semantic judge), Linux/Windows sandboxing, execpolicy's resubmit-with-justification flow for user rules.
-3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` after every slice that touches shared infrastructure — done for this slice despite it touching core spawn code, and it caught nothing new (good sign, not a reason to stop checking).
-4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login, and specifically trying `JCODE_FUSION_SWARM_WORKTREES=1` with a real swarm spawn) still hasn't happened beyond the very first slice's example-based demo — worth doing when the user is present to log in, not something to attempt autonomously.
-5. Update this file at the end of every session — status table, session log entry, next steps — before ending.
+3. **Lesson from the rewind slice, keep applying**: run the *full* `cargo test -p jcode-app-core --lib` after every slice that touches shared infrastructure — done consistently through both worktree slices, caught nothing new either time (good sign, not a reason to stop checking).
+4. Manual/live TUI verification (running `jcode-fusion` interactively with a real login, and specifically trying `JCODE_FUSION_SWARM_WORKTREES=1` with a real swarm spawn) still hasn't happened beyond the very first slice's example-based demo — this remains the single biggest unverified assumption in the whole project. Worth prioritizing over further slices at some point.
+5. Update this file at the end of every session — status table, session log entry, next steps — before ending. **Also update `claude-code-build/SESSION_1_MEMORY.md` if this becomes a new session** — that file is a point-in-time debrief, not a living doc; a Session 2 should either update it or add a `SESSION_2_MEMORY.md` alongside it, not silently let it go stale.
 
 ## Housekeeping reminder
 `jcode-fusion/jcode/target/` is already 4.8GB after one debug build — same kind of build-cache directory that ballooned to 4.9GB in the user's real `~/.jcode/scratch/`. It's safe to `rm -rf target/` any time disk gets tight; nothing of value lives there. Keep an eye on it periodically so this fork doesn't silently repeat that problem long-term.
