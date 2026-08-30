@@ -129,15 +129,88 @@ const RISK_CATEGORIES: &[RiskCategory] = &[
     RiskCategory::PersistentSecurityWeakening,
 ];
 
+/// Recursively flatten a JSON value into `out`, space-separated, for keyword
+/// matching. `PermissionRequest.context` is caller-supplied free-form JSON
+/// (Gemini review, 2026-08-30: a caller could keep `action`/`description`/
+/// `rationale` benign while putting the actual risky instruction here, e.g.
+/// `action="system_cleanup", context={"commands": ["rm -rf /"]}` — this was
+/// previously never inspected at all). Object keys are included too, since
+/// a key name itself can carry the risky text (e.g. `{"rm -rf /": true}`).
+///
+/// **Known, deliberately unfixed gap** (second-pass Gemini review,
+/// 2026-08-30): object keys act as word separators in the flattened
+/// output, so a multi-word keyword can still be split across sibling
+/// values with a key in between -- `{"1": "rm", "2": "-rf"}` flattens to
+/// `" 1 rm 2 -rf"`, which no longer contains the contiguous substring
+/// `"rm -rf"`. Rated low/medium, not high: this is a keyword-matching
+/// precision gap on the *existing* keyword-substring approach, not a new
+/// hole opened by this slice's context-inspection fix -- the exact same
+/// whitespace-adjacency assumption the top-level `normalize_whitespace`
+/// fix already relies on has this same class of limit. Closing it properly
+/// needs a real tokenizer over the flattened text (matching keywords as a
+/// sequence of tokens, not a literal substring), a bigger change than
+/// patching this function; recorded here rather than silently left for a
+/// future session to rediscover as a surprise.
+fn flatten_json_into(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => {
+            out.push(' ');
+            out.push_str(s);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                flatten_json_into(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                out.push(' ');
+                out.push_str(key);
+                flatten_json_into(val, out);
+            }
+        }
+        serde_json::Value::Number(n) => {
+            out.push(' ');
+            out.push_str(&n.to_string());
+        }
+        serde_json::Value::Bool(b) => {
+            out.push(' ');
+            out.push_str(if *b { "true" } else { "false" });
+        }
+        serde_json::Value::Null => {}
+    }
+}
+
+/// Collapse any run of whitespace — including embedded newlines/tabs, and
+/// the double space produced when a keyword is split across two fields
+/// with an empty one in between (`action="rm"`, `description=""`,
+/// `rationale="-rf"` used to format as `"rm  -rf"`, which does not contain
+/// `"rm -rf"`) — into single spaces, so irregular whitespace alone can't
+/// defeat a multi-word keyword. Gemini review, 2026-08-30.
+fn normalize_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Deterministic, keyword-based adjudication of one ambient-mode permission
 /// request. Pure function — no I/O, no async, trivially unit-testable. See
 /// module docs for why this only ever denies or defers, never approves.
+///
+/// **Known, deliberately out-of-scope gap** (Gemini review, 2026-08-30):
+/// non-ASCII homoglyph evasion (e.g. a Cyrillic а substituted for a Latin
+/// a) is not defended against — `.to_lowercase()` case-folds correctly but
+/// does not detect visually-similar different codepoints. Closing that
+/// needs a real confusables table (e.g. the `unicode-security` crate), a
+/// real new dependency, not something to bolt on inside this pure-logic
+/// function. Recorded here rather than silently left unaddressed.
 pub fn adjudicate(request: &PermissionRequest) -> GuardianVerdict {
-    let haystack = format!(
+    let mut haystack = format!(
         "{} {} {}",
         request.action, request.description, request.rationale
-    )
-    .to_ascii_lowercase();
+    );
+    if let Some(context) = &request.context {
+        flatten_json_into(context, &mut haystack);
+    }
+    let haystack = normalize_whitespace(&haystack).to_lowercase();
 
     for category in RISK_CATEGORIES {
         for keyword in category.keywords() {
@@ -254,6 +327,68 @@ mod tests {
             "Clean up old files",
             "Doing this because we need to drop table entries afterward",
         );
+        assert_eq!(adjudicate(&req).decision, GuardianDecision::Deny);
+    }
+
+    fn request_with_context(
+        action: &str,
+        description: &str,
+        rationale: &str,
+        context: serde_json::Value,
+    ) -> PermissionRequest {
+        let mut req = request(action, description, rationale);
+        req.context = Some(context);
+        req
+    }
+
+    /// Gemini review, 2026-08-30: `context` was previously never inspected
+    /// at all, so a caller could keep the three free-text fields benign
+    /// and smuggle the actual dangerous instruction into structured data.
+    #[test]
+    fn keyword_smuggled_into_context_is_still_caught() {
+        let req = request_with_context(
+            "system_cleanup",
+            "Routine background cleanup",
+            "Scheduled maintenance",
+            serde_json::json!({"commands": ["rm -rf /"]}),
+        );
+        assert_eq!(adjudicate(&req).decision, GuardianDecision::Deny);
+    }
+
+    #[test]
+    fn keyword_in_a_context_object_key_is_still_caught() {
+        let req = request_with_context(
+            "system_cleanup",
+            "Routine background cleanup",
+            "Scheduled maintenance",
+            serde_json::json!({"disable the sandbox": true}),
+        );
+        assert_eq!(adjudicate(&req).decision, GuardianDecision::Deny);
+    }
+
+    #[test]
+    fn benign_context_stays_undecided() {
+        let req = request_with_context(
+            "create_pull_request",
+            "Open a PR with the bug fix",
+            "Tested and ready",
+            serde_json::json!({"pr_number": 123, "branch": "fix/issue-123"}),
+        );
+        assert_eq!(adjudicate(&req).decision, GuardianDecision::Undecided);
+    }
+
+    /// Gemini review, 2026-08-30: splitting a keyword across two fields
+    /// with an empty field in between used to produce a double space that
+    /// defeated the exact-substring match.
+    #[test]
+    fn keyword_split_across_fields_with_double_space_is_still_caught() {
+        let req = request("rm", "", "-rf the temp directory");
+        assert_eq!(adjudicate(&req).decision, GuardianDecision::Deny);
+    }
+
+    #[test]
+    fn keyword_split_by_an_embedded_newline_is_still_caught() {
+        let req = request("cleanup", "force\npush to the shared branch", "cleanup");
         assert_eq!(adjudicate(&req).decision, GuardianDecision::Deny);
     }
 }

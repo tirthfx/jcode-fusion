@@ -312,6 +312,17 @@ pub fn checkpoint(session_id: &str, summary: &str) -> Result<Option<Mission>> {
 /// lookup available to it. Refine to session-specific scoping in a later
 /// pass rather than blocking this slice on it; documented here so it isn't
 /// mistaken for an oversight.
+///
+/// Bounded by [`ENFORCE_BUDGET_USAGE_FETCH_TIMEOUT`] (Gemini review,
+/// 2026-08-30): this is called once per turn from `supervisor_gate`, which
+/// itself runs at the top of `overnight.rs::run_supervisor`'s loop before
+/// every coordinator turn — a hung or slow provider-usage endpoint here
+/// previously had no timeout at all and would have stalled the entire
+/// overnight run indefinitely, with no way to recover. The timeout lives at
+/// this call site, not inside `crate::usage::fetch_all_provider_usage`
+/// itself, since that's jcode's own shared upstream function used by other
+/// callers (e.g. Overnight's own usage projection) this project doesn't own
+/// and shouldn't change the blocking behavior of for everyone.
 pub async fn enforce_budget(session_id: &str) -> Result<Option<Mission>> {
     let Some(mission) = load(session_id)? else {
         return Ok(None);
@@ -319,12 +330,37 @@ pub async fn enforce_budget(session_id: &str) -> Result<Option<Mission>> {
     if !matches!(mission.status, MissionStatus::Active) {
         return Ok(Some(mission));
     }
-    let reports = crate::usage::fetch_all_provider_usage().await;
+    let reports = match tokio::time::timeout(
+        ENFORCE_BUDGET_USAGE_FETCH_TIMEOUT,
+        crate::usage::fetch_all_provider_usage(),
+    )
+    .await
+    {
+        Ok(reports) => reports,
+        Err(_) => {
+            // Fail open: same convention as `pre_tool`/`sandbox_macos`/this
+            // module's own `supervisor_gate` elsewhere — a slow usage check
+            // must not itself become the reason a mission can never make
+            // progress. This turn's budget check is simply skipped; the
+            // next turn tries again.
+            crate::logging::warn(&format!(
+                "[mission] enforce_budget: fetch_all_provider_usage timed out after {:?} for \
+                 session {session_id}, skipping budget check this turn",
+                ENFORCE_BUDGET_USAGE_FETCH_TIMEOUT
+            ));
+            return Ok(Some(mission));
+        }
+    };
     if any_provider_hard_limited(&reports) {
         return update_status(session_id, MissionStatus::BudgetLimited);
     }
     Ok(Some(mission))
 }
+
+/// Generous enough for a real multi-provider usage fetch (network calls
+/// across however many accounts are connected) but bounded, so a hung
+/// endpoint can't stall the overnight supervisor loop indefinitely.
+const ENFORCE_BUDGET_USAGE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Pure, network-free decision logic split out from [`enforce_budget`] so it
 /// can be unit-tested directly against constructed `ProviderUsage` values

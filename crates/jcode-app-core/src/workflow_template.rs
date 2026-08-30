@@ -105,6 +105,35 @@ fn placeholder(name: &str) -> String {
     format!("{{{{{name}}}}}")
 }
 
+/// The safe charset for anything echoed back into tool-output text or
+/// interpolated into an error string: `name` (template), node `id`, and
+/// parameter `name`. Gemini review, 2026-08-30: the original charset check
+/// only covered the template's own `name` -- node ids and parameter names
+/// remained unrestricted despite being echoed into `run`'s success message
+/// (joined node ids) and into duplicate-id/dangling-dependency/missing-
+/// parameter error strings, reopening the same newline/ANSI-escape
+/// injection class for two sibling identifiers.
+fn is_safe_identifier_charset(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Strip every ASCII control character (0x00-0x1F and 0x7F — includes
+/// newline/CR/tab and, critically, ESC, the character that starts every
+/// ANSI escape sequence) before embedding an otherwise-unvalidated,
+/// caller-supplied string into output-facing text. Second-pass Gemini
+/// review, 2026-08-30: the fix for the `run`/`list` injection class missed
+/// `load()`'s own "no workflow template named '{name}'" error — a lookup
+/// by name that fails never goes through [`WorkflowTemplate::validate`] at
+/// all (there's no template to validate), so the raw, never-checked input
+/// was still reaching tool-output/error text unfiltered. Used only for
+/// *display*; never for the actual filesystem lookup or comparison, so this
+/// can't be used to smuggle a match past `template_path`'s own sanitizing.
+fn sanitize_for_display(value: &str) -> String {
+    value.chars().filter(|c| !c.is_ascii_control()).collect()
+}
+
 impl WorkflowTemplate {
     /// Validate structural invariants that are cheap to check up front and
     /// would otherwise surface as a confusing failure much later (a
@@ -125,14 +154,9 @@ impl WorkflowTemplate {
         // fake extra list entry; ANSI escapes could spoof terminal UI.
         // Restrict to the same safe charset `sanitize_name` already uses,
         // so a validated template's name is never in need of sanitizing.
-        if !self
-            .name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !is_safe_identifier_charset(&self.name) {
             anyhow::bail!(
-                "workflow template name '{}' must contain only letters, digits, '-', or '_'",
-                self.name
+                "workflow template name must contain only letters, digits, '-', or '_'"
             );
         }
         if self.nodes.is_empty() {
@@ -147,11 +171,17 @@ impl WorkflowTemplate {
                     self.name
                 );
             }
+            if !is_safe_identifier_charset(&node.id) {
+                anyhow::bail!(
+                    "workflow template '{}' has a node id that must contain only letters, \
+                     digits, '-', or '_'",
+                    self.name
+                );
+            }
             if !seen_ids.insert(node.id.as_str()) {
                 anyhow::bail!(
-                    "workflow template '{}' has a duplicate node id '{}'",
-                    self.name,
-                    node.id
+                    "workflow template '{}' has a duplicate node id",
+                    self.name
                 );
             }
         }
@@ -178,6 +208,16 @@ impl WorkflowTemplate {
                     self.name
                 );
             }
+            if !is_safe_identifier_charset(&param.name) {
+                anyhow::bail!(
+                    "workflow template '{}' has a parameter name that must contain only \
+                     letters, digits, '-', or '_'",
+                    self.name
+                );
+            }
+            // Safe to echo `param.name` from here on: the charset check
+            // just above already guarantees it can't inject a newline or
+            // ANSI escape into this (or any later) tool-output text.
             if !seen_params.insert(param.name.as_str()) {
                 anyhow::bail!(
                     "workflow template '{}' declares parameter '{}' more than once",
@@ -302,12 +342,31 @@ pub fn save(template: &WorkflowTemplate) -> Result<()> {
 }
 
 /// Load a previously-saved template by name.
+///
+/// **Re-validates before returning** (Gemini review, 2026-08-30): `save()`
+/// validates before writing, but a hand-edited, imported, or legacy file on
+/// disk bypasses that entirely -- without this, `load()` could hand back a
+/// `WorkflowTemplate` whose `name`/node `id`s/parameter names never went
+/// through the safe-charset check, exactly the gap that made it possible
+/// for a caller of `run` to still end up echoing an unsafe identifier into
+/// tool-output text even after that call site was fixed to use the loaded
+/// `template.name` instead of the raw, unvalidated input. `list()` (below)
+/// reads files directly by path rather than by name, so it can't route
+/// through this function, but applies the same `.validate()` check itself
+/// for the identical reason.
 pub fn load(name: &str) -> Result<WorkflowTemplate> {
     let path = template_path(name)?;
     if !path.exists() {
-        anyhow::bail!("no workflow template named '{}'", name);
+        anyhow::bail!("no workflow template named '{}'", sanitize_for_display(name));
     }
-    crate::storage::read_json(&path)
+    let template: WorkflowTemplate = crate::storage::read_json(&path)?;
+    template.validate().with_context(|| {
+        format!(
+            "workflow template file at {} failed validation on load",
+            path.display()
+        )
+    })?;
+    Ok(template)
 }
 
 /// List the names of every saved template, sorted. Reads the template's own
@@ -315,6 +374,14 @@ pub fn load(name: &str) -> Result<WorkflowTemplate> {
 /// filename to round-trip back to the original name (it doesn't always --
 /// `sanitize_name` is lossy for names containing characters outside
 /// `[A-Za-z0-9_-]`).
+///
+/// **Re-validates each template before including its name** (Gemini
+/// review, 2026-08-30): previously read `name` straight from disk with no
+/// check at all, so a hand-edited/imported/legacy file with an unsafe name
+/// bypassed the charset check entirely and was echoed verbatim into this
+/// function's tool-output text. A template that fails validation is
+/// silently skipped, same as one that fails to parse at all just above --
+/// this is a listing, not a place to surface a half-broken file's error.
 pub fn list() -> Result<Vec<String>> {
     let dir = workflows_dir()?;
     if !dir.exists() {
@@ -329,7 +396,9 @@ pub fn list() -> Result<Vec<String>> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(template) = crate::storage::read_json::<WorkflowTemplate>(&path) {
+        if let Ok(template) = crate::storage::read_json::<WorkflowTemplate>(&path)
+            && template.validate().is_ok()
+        {
             names.push(template.name);
         }
     }
@@ -440,6 +509,79 @@ mod tests {
         assert!(err.contains("subsystem"), "got: {err}");
     }
 
+    /// Gemini review, 2026-08-30: the charset check originally covered only
+    /// the template `name` -- node `id` was unrestricted despite being
+    /// echoed into `run`'s success message and into error text.
+    #[test]
+    fn validate_rejects_a_node_id_with_unsafe_characters() {
+        let mut template = sample_template();
+        template.nodes[0].id = "legit\n- fake-injected-entry".to_string();
+        let err = template.validate().unwrap_err().to_string();
+        assert!(err.contains("letters, digits"), "got: {err}");
+    }
+
+    /// Same gap, parameter names.
+    #[test]
+    fn validate_rejects_a_parameter_name_with_unsafe_characters() {
+        let mut template = sample_template();
+        template.parameters[0].name = "legit\n- fake-injected-entry".to_string();
+        let err = template.validate().unwrap_err().to_string();
+        assert!(err.contains("letters, digits"), "got: {err}");
+    }
+
+    /// Gemini review, 2026-08-30: `save()` validates before writing, but a
+    /// hand-edited/imported/legacy file bypasses that -- `load()` must
+    /// re-validate on the way back out, not trust whatever is on disk.
+    #[tokio::test]
+    async fn load_rejects_a_hand_edited_file_with_an_unsafe_name() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+
+        let mut unsafe_template = sample_template();
+        unsafe_template.name = "legit\n- fake-injected-entry".to_string();
+        let dir = workflows_dir().expect("workflows dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Bypass save()'s own validate() call entirely -- simulating a
+        // hand-edited or imported file, not one this module ever wrote.
+        crate::storage::write_json_fast(
+            &dir.join("hand-edited.json"),
+            &unsafe_template,
+        )
+        .expect("write raw file");
+
+        let result = load("hand-edited");
+        assert!(
+            result.is_err(),
+            "load() must refuse a template that fails validation, not hand it back trusted"
+        );
+    }
+
+    /// Same gap, `list()`'s own separate read path.
+    #[tokio::test]
+    async fn list_skips_a_hand_edited_file_that_fails_validation() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+
+        let mut unsafe_template = sample_template();
+        unsafe_template.name = "legit\n- fake-injected-entry".to_string();
+        let dir = workflows_dir().expect("workflows dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        crate::storage::write_json_fast(&dir.join("hand-edited.json"), &unsafe_template)
+            .expect("write raw file");
+
+        let mut valid = sample_template();
+        valid.name = "a-valid-one".to_string();
+        save(&valid).expect("save valid");
+
+        assert_eq!(
+            list().expect("list"),
+            vec!["a-valid-one".to_string()],
+            "an unsafe on-disk template must be silently skipped, not echoed into the listing"
+        );
+    }
+
     #[test]
     fn validate_rejects_a_template_with_no_nodes() {
         let mut template = sample_template();
@@ -496,6 +638,24 @@ mod tests {
         crate::env::set_var("JCODE_HOME", jcode_home.path());
 
         assert!(load("never-saved").is_err());
+    }
+
+    /// Second-pass Gemini review, 2026-08-30: a lookup-by-name that fails
+    /// never reaches `validate()` (there's no template to validate) --
+    /// the raw, unvalidated `name` argument was still landing unfiltered
+    /// in this error's text, reopening the same class of issue the
+    /// `run`/`list` fixes closed elsewhere.
+    #[tokio::test]
+    async fn load_error_for_an_unknown_name_never_echoes_raw_control_characters() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+
+        let err = load("legit\n\x1b[31m-fake-entry").unwrap_err().to_string();
+        assert!(
+            !err.contains('\n') && !err.contains('\x1b'),
+            "error text must never carry through an embedded newline or ESC byte verbatim, got: {err:?}"
+        );
     }
 
     #[tokio::test]

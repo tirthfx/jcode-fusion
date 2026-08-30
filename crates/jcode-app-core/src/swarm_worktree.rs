@@ -290,10 +290,62 @@ async fn list_conflicted_paths(repo_root: &Path) -> anyhow::Result<Vec<String>> 
 /// Verified by this module's own tests, not just assumed: a conflicting
 /// merge attempt is followed by a real `git status` check confirming no
 /// `MERGE_HEAD` / unmerged state remains.
+/// Ask git itself where `MERGE_HEAD` actually lives for this working tree,
+/// rather than assuming `<repo_root>/.git/MERGE_HEAD`. Gemini review,
+/// 2026-08-30: that assumption silently breaks whenever `repo_root`'s
+/// `.git` is a *file*, not a directory -- which is exactly what a linked
+/// git worktree has (its `.git` is a one-line pointer file to the real git
+/// dir elsewhere). `repo_root.join(".git").join("MERGE_HEAD")` then can
+/// never exist on disk regardless of real merge state, so
+/// `merge_was_in_progress` was silently always `false` for a coordinator
+/// whose own tree is itself a worktree (plausible in this very feature --
+/// nested swarms). `git rev-parse --git-path` is git's own blessed way to
+/// resolve this correctly for both plain repos and worktrees, so this
+/// reuses that instead of reimplementing git's directory-layout rules.
+async fn merge_head_path(repo_root: &Path) -> Option<PathBuf> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("rev-parse")
+        .arg("--git-path")
+        .arg("MERGE_HEAD")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    })
+}
+
+/// Serializes every merge-back attempt across every repo. Gemini review,
+/// 2026-08-30: two concurrent `apply` calls against the same coordinator
+/// repo could race on git's own `.git/index.lock` -- the loser's `git
+/// merge` fails immediately (lock held by the winner), but its own
+/// `MERGE_HEAD` check then sees the *winner's* transient `MERGE_HEAD` (the
+/// same shared `repo_root`) and concludes a merge of *its own* needs
+/// aborting, tearing down the winner's still-in-flight merge via `git
+/// merge --abort`. A single process-wide async mutex (not a lock keyed per
+/// `repo_root` -- merge-back is not a hot path, so the same simplicity
+/// tradeoff already made for `rewind_store`'s lock applies here) makes only
+/// one [`merge_worktree_branch`] call run at a time, closing the race by
+/// construction rather than by hoping callers never overlap.
+static MERGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn merge_worktree_branch(
     repo_root: &Path,
     worktree_path: &Path,
 ) -> anyhow::Result<MergeOutcome> {
+    let _guard = MERGE_LOCK.lock().await;
     if !worktree_is_clean(worktree_path).await? {
         anyhow::bail!(
             "worktree at {} has uncommitted changes -- commit or discard them before merging",
@@ -350,7 +402,9 @@ pub async fn merge_worktree_branch(
     // --abort` would itself fail with "There is no merge to abort" -- a
     // false alarm, not a real "repo left mid-merge" problem. Only run (and
     // require) a real abort when a merge was genuinely in progress.
-    let merge_head = repo_root.join(".git").join("MERGE_HEAD");
+    let merge_head = merge_head_path(repo_root)
+        .await
+        .unwrap_or_else(|| repo_root.join(".git").join("MERGE_HEAD"));
     let merge_was_in_progress = tokio::fs::try_exists(&merge_head).await.unwrap_or(false);
     let files = list_conflicted_paths(repo_root).await.unwrap_or_default();
 
@@ -856,5 +910,115 @@ mod tests {
 
         let result = merge_worktree_branch(repo.path(), &fake_worktree).await;
         assert!(result.is_err());
+    }
+
+    /// Gemini review, 2026-08-30: `MERGE_LOCK` serializes every
+    /// `merge_worktree_branch` call process-wide. This doesn't reproduce
+    /// the actual race window (that needs precise timing on git's own
+    /// `index.lock` that isn't practical to force deterministically in a
+    /// test) but does prove the lock doesn't itself introduce a deadlock:
+    /// two independent, unrelated merges run concurrently and both must
+    /// still complete successfully.
+    #[tokio::test]
+    async fn concurrent_merges_against_different_repos_both_complete_without_deadlocking() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+
+        let repo_a = init_test_repo().await;
+        let repo_b = init_test_repo().await;
+        let worktree_a = create_worktree(repo_a.path(), "worker-a")
+            .await
+            .expect("create worktree a");
+        let worktree_b = create_worktree(repo_b.path(), "worker-b")
+            .await
+            .expect("create worktree b");
+        std::fs::write(worktree_a.join("feature_a.txt"), "a\n").expect("write a");
+        git_ok(&worktree_a, &["add", "."]);
+        git_ok(&worktree_a, &["commit", "-q", "-m", "worker a: add file"]);
+        std::fs::write(worktree_b.join("feature_b.txt"), "b\n").expect("write b");
+        git_ok(&worktree_b, &["add", "."]);
+        git_ok(&worktree_b, &["commit", "-q", "-m", "worker b: add file"]);
+
+        let (result_a, result_b) = tokio::join!(
+            merge_worktree_branch(repo_a.path(), &worktree_a),
+            merge_worktree_branch(repo_b.path(), &worktree_b),
+        );
+        assert!(matches!(result_a, Ok(MergeOutcome::Merged { .. })));
+        assert!(matches!(result_b, Ok(MergeOutcome::Merged { .. })));
+    }
+
+    /// Gemini review, 2026-08-30: `repo_root.join(".git").join("MERGE_HEAD")`
+    /// silently breaks when `repo_root`'s own `.git` is a *file* (a linked
+    /// worktree's own layout), not a directory -- exactly the case where
+    /// the coordinator's own tree is itself a worktree (plausible with
+    /// nested swarms). Reproduces that for real: the "coordinator" in this
+    /// test is itself a `git worktree add`-created worktree, not the main
+    /// checkout, and a genuine conflicting merge is attempted against it.
+    #[tokio::test]
+    async fn merge_conflict_is_detected_and_aborted_even_when_the_coordinator_tree_is_itself_a_worktree()
+     {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+
+        // The "coordinator" here is a linked worktree, not the main repo
+        // checkout -- its own `.git` is a one-line pointer *file*.
+        let coordinator = repo.path().join("coordinator-worktree");
+        git_ok(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                coordinator.to_str().expect("utf8 path"),
+                "-b",
+                "coordinator-branch",
+            ],
+        );
+        assert!(
+            coordinator.join(".git").is_file(),
+            "sanity check: a linked worktree's .git must be a file, not a directory"
+        );
+
+        // A worker worktree spawned from the coordinator's own tree.
+        let worker_path = create_worktree(&coordinator, "worker-nested")
+            .await
+            .expect("create nested worktree");
+
+        // Diverge on the same line so the merge genuinely conflicts.
+        std::fs::write(coordinator.join("README.md"), "coordinator's version\n")
+            .expect("write coordinator side");
+        git_ok(&coordinator, &["add", "."]);
+        git_ok(&coordinator, &["commit", "-q", "-m", "coordinator: edit README"]);
+
+        std::fs::write(worker_path.join("README.md"), "worker's version\n")
+            .expect("write worker side");
+        git_ok(&worker_path, &["add", "."]);
+        git_ok(&worker_path, &["commit", "-q", "-m", "worker: edit README"]);
+
+        let outcome = merge_worktree_branch(&coordinator, &worker_path)
+            .await
+            .expect("merge call itself should not error on a conflict");
+        assert!(
+            matches!(outcome, MergeOutcome::Conflict { .. }),
+            "expected a detected conflict, got {outcome:?}"
+        );
+
+        // The real proof: if `merge_was_in_progress` had silently stayed
+        // `false` (the bug), `git merge --abort` would never have run, and
+        // the coordinator worktree would still show a real MERGE_HEAD.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&coordinator)
+            .arg("status")
+            .arg("--porcelain")
+            .output()
+            .expect("git status");
+        assert!(
+            status.stdout.is_empty(),
+            "coordinator worktree must be left clean after the aborted merge, got: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
     }
 }

@@ -92,6 +92,18 @@ pub fn load_user_rules(path: &std::path::Path) -> anyhow::Result<Vec<UserRule>> 
 /// only lives for the closure's duration) rather than a direct `Module::new`
 /// call; verified against the crate's own source after `Module::new()`
 /// didn't compile, not guessed twice.
+/// Ticks (roughly: one function call or one loop backedge) and heap bytes
+/// permitted for one policy-file evaluation. Generous for what this file is
+/// meant to hold (a `RULES` list, at most built with simple loops/
+/// comprehensions) but real bounds: Gemini review, 2026-08-30, found this
+/// evaluator previously had none at all, so a huge string multiplication or
+/// a large comprehension in `~/.jcode/execpolicy.star` (malicious or just a
+/// mistake) could hang the process or exhaust memory — worse than the
+/// documented "fail closed to the built-in classifier" behavior, since it
+/// never gets the chance to fail at all.
+const MAX_POLICY_EVAL_TICKS: u64 = 1_000_000;
+const MAX_POLICY_EVAL_HEAP_BYTES: usize = 16 * 1024 * 1024;
+
 fn parse_policy_source(content: &str) -> anyhow::Result<Vec<UserRule>> {
     let ast = AstModule::parse("execpolicy.star", content.to_string(), &Dialect::Standard)
         .map_err(|err| anyhow::anyhow!("failed to parse execpolicy.star: {err}"))?;
@@ -99,6 +111,17 @@ fn parse_policy_source(content: &str) -> anyhow::Result<Vec<UserRule>> {
 
     Module::with_temp_heap(|module| -> anyhow::Result<Vec<UserRule>> {
         let mut eval = Evaluator::new(&module);
+        // Both limits are enforced by starlark-rust itself during
+        // eval_module (verified against the crate's own test,
+        // `test_tick_count_limit`), not something this module has to poll
+        // for manually — an over-limit script surfaces as a real `Err`
+        // here, which the existing fail-open handling at the call site
+        // (`tool/bash_destructive_gate.rs::user_rules`) already treats the
+        // same as any other malformed policy file.
+        eval.set_max_tick_count(MAX_POLICY_EVAL_TICKS)
+            .expect("tick limit is set exactly once, non-zero");
+        eval.set_max_heap_size(MAX_POLICY_EVAL_HEAP_BYTES)
+            .expect("heap limit is set exactly once, non-zero");
         eval.eval_module(ast, &globals)
             .map_err(|err| anyhow::anyhow!("failed to evaluate execpolicy.star: {err}"))?;
 
@@ -291,5 +314,32 @@ RULES = [p + "|confirm|generated" for p in prefixes]
             Some(&rule)
         );
         assert_eq!(combine(BuiltInRestrictiveness::Allow, None), None);
+    }
+
+    /// Gemini review, 2026-08-30: the evaluator previously had no tick/heap
+    /// limit at all, so a policy script that just burns CPU (no I/O, no
+    /// network — a plain loop) could hang the process indefinitely rather
+    /// than failing closed like every other malformed-policy case.
+    #[test]
+    fn a_runaway_loop_is_stopped_by_the_tick_limit_not_left_to_hang() {
+        let source = r#"
+RULES = []
+for i in range(100000000):
+    RULES = RULES + [str(i)]
+"#;
+        let result = parse_policy_source(source);
+        assert!(
+            result.is_err(),
+            "a script that would run far longer than the tick budget must fail, not hang"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_policy_well_within_the_limits_still_parses_fine() {
+        let source = r#"
+RULES = ["prefix" + str(i) + "|confirm|reason" for i in range(50)]
+"#;
+        let rules = parse_policy_source(source).expect("a modest, realistic policy must parse");
+        assert_eq!(rules.len(), 50);
     }
 }

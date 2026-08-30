@@ -195,9 +195,27 @@ impl Agent {
         let preserve_testing_build = self.session.testing_build.clone();
         let preserve_debug = self.session.is_debug;
         let preserve_working_dir = self.session.working_dir.clone();
+        let closing_session_id = self.session.id.clone();
 
         self.session.mark_closed();
         self.persist_session_best_effort("pre-clear session close state");
+        // Gemini review, 2026-08-30: this session's rewind stack
+        // (~/.jcode/rewind/<id>.json, plus its .bak) was never cleaned up
+        // here, leaking on disk forever. Safe specifically for `clear()`
+        // (unlike a plain session *switch* -- see
+        // `restore_session_with_working_dir`, which deliberately does NOT
+        // do this): the conversation is being explicitly discarded and
+        // replaced by a brand-new session, matching the "cleared only by
+        // an explicit, deliberate action (e.g. session end)" exception
+        // `reset_runtime_state_for_session_change`'s own doc comment
+        // already calls out. Best-effort: a failure to clean up old
+        // rewind history must not block starting the new session.
+        if let Err(err) = crate::rewind_store::clear(&closing_session_id) {
+            logging::warn(&format!(
+                "Failed to clear rewind stack for cleared session {}: {}",
+                closing_session_id, err
+            ));
+        }
 
         let mut new_session = Session::create(None, None);
         new_session.mark_active();
@@ -655,6 +673,17 @@ impl Agent {
         self.restore_session_with_working_dir(session_id, None)
     }
 
+    /// **Deliberately does NOT clear the previous session's rewind stack**
+    /// (Gemini review, 2026-08-30, considered and rejected here — see
+    /// `Agent::clear()` for the sibling fix that *does* apply it): unlike
+    /// `clear()`, this function is used for ordinary session *switching*
+    /// (e.g. the TUI resuming a different session by id), not retiring one.
+    /// The previous session is not discarded — a caller may switch back to
+    /// it later — so clearing its rewind history here would silently
+    /// destroy still-live undo data, a worse bug than the disk-space leak
+    /// it would "fix." Only `clear()`'s own explicit "discard and replace
+    /// this conversation" action is safe to also discard rewind history
+    /// for.
     pub(crate) fn restore_session_with_working_dir(
         &mut self,
         session_id: &str,

@@ -81,6 +81,30 @@ fn compute_hash(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Serializes every push/pop against every session's persisted rewind
+/// stack. Gemini review, 2026-08-30: `push_snapshot`/`pop_snapshot`
+/// previously did an unguarded load -> mutate -> save round trip, relying
+/// entirely on an *external* lock (the caller's own `Mutex<Agent>`) — a
+/// second concurrent caller for the same session (e.g. two live client
+/// connections attached to the same session, or a future call path that
+/// simply forgets to hold that lock) could cause a lost snapshot, or pop
+/// the same top snapshot twice while the on-disk stack only shrinks once.
+/// One process-wide mutex (not a per-`session_id` map, since rewind is not
+/// a hot path — the small, harmless over-serialization across unrelated
+/// sessions isn't worth a lock-map's own lifecycle complexity) makes this
+/// module safe against concurrent callers by construction, not by caller
+/// discipline.
+static REWIND_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`REWIND_STORE_LOCK`], recovering from poisoning rather than
+/// panicking: a panic *elsewhere* while the lock was held must not
+/// permanently wedge every future rewind operation in the process.
+fn lock_rewind_store() -> std::sync::MutexGuard<'static, ()> {
+    REWIND_STORE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Push a new snapshot onto this session's undo stack. Returns the new
 /// stack depth (number of available undo levels, including this one).
 pub fn push_snapshot(
@@ -96,6 +120,7 @@ pub fn push_snapshot(
         &session_provider_session_id,
         visible_message_count,
     )?;
+    let _guard = lock_rewind_store();
     let mut stack = load_stack(session_id)?;
     stack.snapshots.push(RewindSnapshot {
         messages,
@@ -114,6 +139,7 @@ pub fn push_snapshot(
 /// snapshot is removed from the persisted stack. On a failed integrity
 /// check, the stack is left untouched (see [`PopOutcome::Corrupt`]).
 pub fn pop_snapshot(session_id: &str) -> Result<PopOutcome> {
+    let _guard = lock_rewind_store();
     let mut stack = load_stack(session_id)?;
     let Some(snapshot) = stack.snapshots.pop() else {
         return Ok(PopOutcome::Empty);
@@ -149,6 +175,7 @@ pub fn depth(session_id: &str) -> Result<usize> {
 
 /// Discard the entire undo stack for this session (e.g. on session end).
 pub fn clear(session_id: &str) -> Result<()> {
+    let _guard = lock_rewind_store();
     let path = stack_path(session_id)?;
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -294,6 +321,34 @@ mod tests {
                 depth(session_id).expect("depth"),
                 1,
                 "a refused/corrupt snapshot must not be silently dropped from the stack"
+            );
+        });
+    }
+
+    /// Gemini review, 2026-08-30: push_snapshot's load -> mutate -> save
+    /// was previously unguarded; two concurrent pushes for the same
+    /// session could both load the same prior stack, each append their own
+    /// snapshot, and save -- whichever save landed last would silently
+    /// discard the other. Real concurrent threads (not just a sequential
+    /// simulation), same process -- exactly the "two callers for the same
+    /// session_id" scenario the finding describes.
+    #[test]
+    fn concurrent_pushes_for_the_same_session_never_lose_a_snapshot() {
+        with_isolated_home(|| {
+            let session_id = "ses_concurrent";
+            const PUSHES: usize = 20;
+            std::thread::scope(|scope| {
+                for i in 0..PUSHES {
+                    scope.spawn(move || {
+                        push_snapshot(session_id, vec![msg(&format!("m{i}"))], None, None, i)
+                            .expect("push");
+                    });
+                }
+            });
+            assert_eq!(
+                depth(session_id).expect("depth"),
+                PUSHES,
+                "every concurrent push must land -- none may be silently lost to a race"
             );
         });
     }

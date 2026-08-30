@@ -70,28 +70,43 @@ pub(super) fn destructive_command_refusal(
     justification: Option<&str>,
     working_dir: Option<std::path::PathBuf>,
 ) -> Option<String> {
+    // Gemini review, 2026-08-30: previously each branch below called
+    // `check_user_policy_only` directly, so the "user rules can only
+    // escalate, never downgrade a built-in restriction" invariant held only
+    // by call-site discipline — a future refactor that reached
+    // `check_user_policy_only` from the Deny/Reflect side (even by
+    // accident) would have nothing structurally stopping it. Restructured
+    // so the built-in verdict's own refusal (if any) is computed first as
+    // a plain `Option<String>`, and the user-policy check only ever runs
+    // via `.or_else()` — which the compiler guarantees only executes when
+    // `built_in_refusal` is `None`. It is now impossible to reach
+    // `check_user_policy_only` on a path that already produced a built-in
+    // refusal, regardless of how this function gets refactored later.
     let risk_ctx = jcode_command_risk::RiskContext::from_env(working_dir);
     let assessment = jcode_command_risk::assess(command, &risk_ctx);
-    if assessment.level.runs_immediately() {
-        return check_user_policy_only(command);
-    }
 
-    let justification = jcode_command_risk::Justification {
-        text: justification.map(str::to_string),
+    let built_in_refusal: Option<String> = if assessment.level.runs_immediately() {
+        None
+    } else {
+        let justification = jcode_command_risk::Justification {
+            text: justification.map(str::to_string),
+        };
+        match jcode_command_risk::gate(&assessment, &justification) {
+            jcode_command_risk::GateOutcome::Allow => None,
+            jcode_command_risk::GateOutcome::Deny { reason } => {
+                crate::logging::warn(&format!("[bash] denied destructive command: {command}"));
+                Some(reason)
+            }
+            jcode_command_risk::GateOutcome::Reflect { prompt } => {
+                crate::logging::info(&format!(
+                    "[bash] destructive command held for justification: {command}"
+                ));
+                Some(prompt)
+            }
+        }
     };
-    match jcode_command_risk::gate(&assessment, &justification) {
-        jcode_command_risk::GateOutcome::Allow => check_user_policy_only(command),
-        jcode_command_risk::GateOutcome::Deny { reason } => {
-            crate::logging::warn(&format!("[bash] denied destructive command: {command}"));
-            Some(reason)
-        }
-        jcode_command_risk::GateOutcome::Reflect { prompt } => {
-            crate::logging::info(&format!(
-                "[bash] destructive command held for justification: {command}"
-            ));
-            Some(prompt)
-        }
-    }
+
+    built_in_refusal.or_else(|| check_user_policy_only(command))
 }
 
 /// The built-in gate already said `Allow` — check whether a user execpolicy

@@ -211,9 +211,18 @@ impl Tool for WorkflowTool {
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to seed task graph: {}", e))?;
                     ensure_success(&response)?;
+                    // Echo `template.name` (validated by `load()`, see
+                    // that function's doc comment), not the raw `name`
+                    // param this action was called with -- Gemini review,
+                    // 2026-08-30: using the caller-supplied string here
+                    // reintroduced the exact newline/ANSI-escape injection
+                    // an earlier fix closed for `list()`'s own output,
+                    // just in a sibling code path. `node_ids` are safe to
+                    // echo too: `instantiate()` only ever returns ids that
+                    // passed `validate()`'s charset check.
                     Ok(ToolOutput::new(format!(
                         "Ran workflow template '{}' ({} node(s) seeded: {}).",
-                        name,
+                        template.name,
                         node_ids.len(),
                         node_ids.join(", ")
                     )))

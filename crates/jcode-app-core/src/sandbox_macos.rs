@@ -77,22 +77,48 @@ pub fn default_protected_write_subpaths() -> Vec<&'static str> {
 /// takes the already-resolved absolute paths to protect rather than
 /// resolving `$HOME` itself, so tests don't depend on the real home
 /// directory.
+/// sandbox-exec's profile language uses Scheme-style string literals;
+/// escape any embedded quotes/backslashes defensively even though real
+/// filesystem paths essentially never contain them, rather than assuming
+/// they can't.
+fn escape_seatbelt_string(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 pub fn build_seatbelt_profile(protected_write_paths: &[PathBuf]) -> String {
     let mut profile = String::from("(version 1)\n(allow default)\n");
     if !protected_write_paths.is_empty() {
         profile.push_str("(deny file-write*\n");
         for path in protected_write_paths {
-            // sandbox-exec's profile language uses Scheme-style string
-            // literals; escape any embedded quotes/backslashes defensively
-            // even though real filesystem paths essentially never contain
-            // them, rather than assuming they can't.
-            let escaped = path
-                .to_string_lossy()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
+            let escaped = escape_seatbelt_string(&path.to_string_lossy());
             profile.push_str(&format!("  (subpath \"{escaped}\")\n"));
         }
         profile.push_str(")\n");
+
+        // Gemini review, 2026-08-30: a `subpath` rule on e.g. `~/.config/gh`
+        // only matches operations whose *target* path is under `.config/gh`
+        // -- it does nothing to stop renaming the *parent* (`~/.config`)
+        // out from under it, since `(allow default)` otherwise permits that
+        // rename freely and the renamed path (`~/.config`) isn't itself a
+        // subpath of `.config/gh`. Close that by also denying
+        // rename/unlink of each protected path's own immediate parent
+        // directory, as a *literal* (not `subpath`) rule -- this does not
+        // block ordinary writes to sibling files inside that parent, only
+        // renaming/removing the parent entry itself.
+        let mut parents: Vec<String> = protected_write_paths
+            .iter()
+            .filter_map(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        parents.sort();
+        parents.dedup();
+        for parent in &parents {
+            let escaped = escape_seatbelt_string(parent);
+            profile.push_str(&format!(
+                "(deny file-write-rename (literal \"{escaped}\"))\n\
+                 (deny file-write-unlink (literal \"{escaped}\"))\n"
+            ));
+        }
     }
     profile
 }
@@ -127,10 +153,33 @@ pub fn resolve_default_protected_paths() -> Vec<PathBuf> {
 /// real, unpredictable `$HOME`.
 fn resolve_protected_paths_from(home: &std::path::Path) -> Vec<PathBuf> {
     let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    default_protected_write_subpaths()
-        .into_iter()
-        .map(|sub| home.join(sub))
-        .collect()
+    let mut paths = Vec::new();
+    for sub in default_protected_write_subpaths() {
+        let joined = home.join(sub);
+        // Gemini review, 2026-08-30 (first pass): only `$HOME` itself was
+        // being canonicalized -- if a protected *leaf* (e.g. `~/.ssh`,
+        // `~/.aws`) is itself a symlink, the deny rule was written against
+        // the un-resolved leaf path while Seatbelt matches the resolved
+        // filesystem path, leaving the real target directory completely
+        // unprotected. Fixed by also canonicalizing each leaf.
+        //
+        // Second pass caught a real gap in that fix: protecting *only* the
+        // canonical target (replacing `joined` instead of adding to it)
+        // left the symlink *entry itself* unprotected -- `unlink()`
+        // operates on the symlink's own path, not its resolved target, so
+        // an attacker could `rm ~/.ssh` (the symlink) and `mkdir ~/.ssh`
+        // fresh, writing into a brand-new, entirely unprotected directory
+        // at the same literal path. Both the literal leaf path and its
+        // canonical resolution are protected now, not one or the other.
+        let canonical = std::fs::canonicalize(&joined).ok();
+        paths.push(joined.clone());
+        if let Some(canonical) = canonical
+            && canonical != joined
+        {
+            paths.push(canonical);
+        }
+    }
+    paths
 }
 
 /// If sandboxing is requested and this process isn't already running inside
@@ -250,6 +299,77 @@ mod tests {
                 symlinked_home.display()
             );
         }
+    }
+
+    /// Gemini review, 2026-08-30: a symlinked *leaf* (not just a symlinked
+    /// `$HOME`) used to leave the real target directory unprotected, since
+    /// only `$HOME` was canonicalized before joining subpaths.
+    #[test]
+    fn resolved_paths_follow_symlinks_on_the_leaf_itself_not_just_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let real_ssh_target = temp.path().join("real_ssh_elsewhere");
+        std::fs::create_dir_all(&real_ssh_target).expect("mkdir real target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_ssh_target, home.join(".ssh")).expect("symlink leaf");
+
+        let resolved = resolve_protected_paths_from(&home);
+        let expected_real_path =
+            std::fs::canonicalize(&real_ssh_target).expect("canonicalize real target");
+        assert!(
+            resolved.contains(&expected_real_path),
+            "expected the resolved paths ({resolved:?}) to include the real target of the \
+             symlinked ~/.ssh ({expected_real_path:?}), not just the symlink's own path"
+        );
+        // Second-pass fix, Gemini review 2026-08-30: protecting *only* the
+        // canonical target left the symlink entry itself removable
+        // (`unlink` operates on the symlink's own path, not its resolved
+        // target) -- an attacker could delete the symlink and recreate
+        // `~/.ssh` fresh at the same literal, unprotected path. Both the
+        // literal leaf path and its resolved target must be present. `home`
+        // itself is canonicalized before joining (same as `$HOME` always
+        // was), so the expected literal path is joined against the
+        // canonical home, not the possibly-symlinked input `home`.
+        let canonical_home = std::fs::canonicalize(&home).expect("canonicalize home");
+        assert!(
+            resolved.contains(&canonical_home.join(".ssh")),
+            "expected the resolved paths ({resolved:?}) to ALSO include the literal symlink \
+             path itself ({:?}) -- otherwise the symlink entry could be deleted and replaced \
+             with a fresh, unprotected directory at the same path",
+            canonical_home.join(".ssh")
+        );
+    }
+
+    /// Gemini review, 2026-08-30: a `subpath` rule alone doesn't stop
+    /// renaming the *parent* of a protected path out from under it.
+    #[test]
+    fn profile_also_denies_renaming_or_unlinking_each_protected_paths_parent() {
+        let paths = vec![
+            PathBuf::from("/Users/test/.config/gh"),
+            PathBuf::from("/Users/test/.config/gcloud"),
+            PathBuf::from("/Users/test/.ssh"),
+        ];
+        let profile = build_seatbelt_profile(&paths);
+        assert!(
+            profile.contains(r#"(deny file-write-rename (literal "/Users/test/.config"))"#),
+            "expected a rename-deny on the shared parent .config, got: {profile}"
+        );
+        assert!(
+            profile.contains(r#"(deny file-write-unlink (literal "/Users/test/.config"))"#),
+            "expected an unlink-deny on the shared parent .config, got: {profile}"
+        );
+        assert!(
+            profile.contains(r#"(deny file-write-rename (literal "/Users/test"))"#),
+            "expected a rename-deny on .ssh's parent, got: {profile}"
+        );
+        // The shared parent (.config) must appear only once even though
+        // two protected paths live under it.
+        assert_eq!(
+            profile.matches(r#"(deny file-write-rename (literal "/Users/test/.config"))"#).count(),
+            1,
+            "a shared parent must be deduplicated, not repeated once per child"
+        );
     }
 
     #[test]
