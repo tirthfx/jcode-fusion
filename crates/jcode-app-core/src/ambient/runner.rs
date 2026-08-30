@@ -842,6 +842,22 @@ impl AmbientRunnerHandle {
                                 ));
                             }
                         }
+
+                        // Fusion Phase 4, phase 2 of item #9: render the
+                        // current (global-scope) memory set into
+                        // `MEMORY.md`, sequenced after extraction above so
+                        // this cycle's own freshly-extracted memories (if
+                        // any) are reflected in the same render, not a
+                        // stale snapshot from before this cycle ran.
+                        // Opt-in (`JCODE_FUSION_MEMORY_MD=1`, default off,
+                        // its own separate variable from
+                        // `JCODE_FUSION_MEMORY_CONSOLIDATION` -- the two
+                        // halves of item #9 are independently toggleable).
+                        if let Err(e) = crate::memory_consolidator::run_memory_md_consolidation() {
+                            logging::error(&format!(
+                                "Ambient: MEMORY.md consolidation failed: {e}"
+                            ));
+                        }
                     });
                 }
                 Err(e) => {

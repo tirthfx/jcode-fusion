@@ -206,10 +206,84 @@ pub fn write_consolidated_memory_file(
     let _guard = lock_consolidation();
     let memories = manager.list_all()?;
     let document = render_memory_document(&memories, generated_at);
+
+    // Gemini review, 2026-08-30: the rendered document always embeds
+    // `generated_at`, so a naive "always write" would rewrite the file on
+    // *every single call* even when the underlying memory set hasn't
+    // changed at all -- directly undermining this module's own stated
+    // goal (a stable git diff that only shows genuine content changes),
+    // and needless disk I/O / file-watcher churn on every ambient cycle.
+    // Skip the write entirely when the only difference from what's
+    // already on disk is the timestamp line itself.
+    if let Ok(existing) = std::fs::read_to_string(target_path)
+        && body_ignoring_timestamp(&existing) == body_ignoring_timestamp(&document)
+    {
+        return Ok(());
+    }
+
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     crate::storage::write_bytes(target_path, document.as_bytes())
+}
+
+/// Strip the one line that varies purely with wall-clock time (the
+/// "Consolidated automatically... on <timestamp>" line), so two renders of
+/// an unchanged memory set compare equal regardless of when each was
+/// generated. A prefix match rather than a fixed full-string match, since
+/// the timestamp text itself differs between the two documents being
+/// compared -- that's exactly the part meant to be ignored.
+fn body_ignoring_timestamp(document: &str) -> String {
+    document
+        .lines()
+        .filter(|line| !line.starts_with("_Consolidated automatically by jcode-fusion on "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Environment variable gating the periodic trigger below, same
+/// opt-in-by-default-off convention every other Fusion feature already
+/// uses. Deliberately its own separate variable from
+/// `memory_consolidation`'s `JCODE_FUSION_MEMORY_CONSOLIDATION` --
+/// leasing/extraction and rendering `MEMORY.md` are two different halves of
+/// item #9, a user should be able to turn either on independently.
+const MEMORY_MD_ENV_VAR: &str = "JCODE_FUSION_MEMORY_MD";
+
+pub fn is_memory_md_wiring_enabled() -> bool {
+    std::env::var(MEMORY_MD_ENV_VAR)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Where the consolidated document is written. **A real, documented scope
+/// simplification, not the original design's assumption**: `PROGRESS.md`'s
+/// scoping note for this phase assumed a project's own git-tracked root
+/// (matching this phase's original "under a git-baselined directory"
+/// framing) -- but the ambient cycle this gets triggered from already
+/// treats memory operations as global-scope, not project-scoped (see
+/// `backfill_embeddings`'s own sibling call in `ambient/runner.rs`,
+/// constructed with no project directory either). Picking a per-project
+/// path would need the ambient cycle to know *which* project it's
+/// consolidating for, which it doesn't reliably have one single answer to.
+/// `~/.jcode/MEMORY.md` is consistent with that existing precedent, not a
+/// new design decision invented here -- revisit if a future slice adds
+/// real per-project ambient scoping.
+fn memory_md_target_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(crate::storage::jcode_dir()?.join("MEMORY.md"))
+}
+
+/// The actual per-cycle trigger: render the current global memory set into
+/// `MEMORY.md`, if enabled. Mirrors `memory_consolidation::
+/// run_one_ambient_extraction`'s own shape (an `is_*_enabled` gate,
+/// `Ok(())`/no-op when disabled) so the two triggers read the same way at
+/// their one call site in `ambient/runner.rs`.
+pub fn run_memory_md_consolidation() -> anyhow::Result<()> {
+    if !is_memory_md_wiring_enabled() {
+        return Ok(());
+    }
+    let manager = crate::memory::MemoryManager::new();
+    let target = memory_md_target_path()?;
+    write_consolidated_memory_file(&target, &manager, Utc::now())
 }
 
 #[cfg(test)]
@@ -376,6 +450,40 @@ mod tests {
     }
 
     #[test]
+    fn write_consolidated_memory_file_skips_the_write_when_only_the_timestamp_would_change() {
+        // Regression for a real bug an agy review caught: the document
+        // always embeds `generated_at`, so writing unconditionally on
+        // every call would rewrite the file every single time even when
+        // the underlying memory set is identical -- churn, and it defeats
+        // this module's own "stable, content-only git diff" goal.
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("MEMORY.md");
+
+        let manager = crate::memory::MemoryManager::new_test();
+        manager
+            .remember_project(crate::memory_types::MemoryEntry::new(
+                MemoryCategory::Fact,
+                "an unchanging fact",
+            ))
+            .expect("seed memory");
+
+        write_consolidated_memory_file(&target, &manager, fixed_time()).expect("first write");
+        let later_time = DateTime::parse_from_rfc3339("2026-08-30T18:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        write_consolidated_memory_file(&target, &manager, later_time).expect("second write");
+
+        // If the second write had actually happened, the file would show
+        // the later timestamp. It must still show the *first* one --
+        // proof the second call was skipped as a no-op, not that it
+        // coincidentally produced identical output.
+        let written = std::fs::read_to_string(&target).expect("read back");
+        assert!(written.contains("2026-08-30 12:00 UTC"));
+        assert!(!written.contains("18:00 UTC"));
+    }
+
+    #[test]
     fn write_consolidated_memory_file_overwrites_a_previous_render() {
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -409,5 +517,57 @@ mod tests {
             !written.contains("first pass fact"),
             "a fresh render must replace the prior content, not append to it"
         );
+    }
+
+    #[test]
+    fn is_memory_md_wiring_enabled_is_off_by_default() {
+        let _guard = crate::storage::lock_test_env();
+        crate::env::remove_var(MEMORY_MD_ENV_VAR);
+        assert!(!is_memory_md_wiring_enabled());
+    }
+
+    #[test]
+    fn is_memory_md_wiring_enabled_reflects_the_env_var() {
+        let _guard = crate::storage::lock_test_env();
+        crate::env::set_var(MEMORY_MD_ENV_VAR, "1");
+        assert!(is_memory_md_wiring_enabled());
+        crate::env::remove_var(MEMORY_MD_ENV_VAR);
+    }
+
+    #[test]
+    fn run_memory_md_consolidation_is_a_noop_when_disabled() {
+        let _guard = crate::storage::lock_test_env();
+        crate::env::remove_var(MEMORY_MD_ENV_VAR);
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        run_memory_md_consolidation().expect("must not error when disabled");
+        assert!(
+            !temp.path().join("MEMORY.md").exists(),
+            "a disabled trigger must not write anything at all"
+        );
+    }
+
+    #[test]
+    fn run_memory_md_consolidation_writes_the_file_when_enabled() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        crate::env::set_var(MEMORY_MD_ENV_VAR, "1");
+
+        let manager = crate::memory::MemoryManager::new();
+        manager
+            .remember_global(crate::memory_types::MemoryEntry::new(
+                MemoryCategory::Fact,
+                "a global fact",
+            ))
+            .expect("seed global memory");
+
+        let result = run_memory_md_consolidation();
+        crate::env::remove_var(MEMORY_MD_ENV_VAR);
+        result.expect("must succeed");
+
+        let written = std::fs::read_to_string(temp.path().join("MEMORY.md")).expect("read back");
+        assert!(written.contains("a global fact"));
     }
 }
