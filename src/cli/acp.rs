@@ -391,7 +391,8 @@ impl AcpRuntime {
             return Ok(());
         }
 
-        match self.create_new_session(cwd).await {
+        let mcp_servers = parse_acp_mcp_servers(&message.params);
+        match self.create_new_session(cwd, mcp_servers).await {
             Ok(session) => {
                 let session_id = session.session_id.clone();
                 let state = session.ui_state.lock().await.clone();
@@ -759,7 +760,11 @@ impl AcpRuntime {
         Ok(stream.into_split())
     }
 
-    async fn create_new_session(&self, cwd: PathBuf) -> Result<DaemonSession> {
+    async fn create_new_session(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Vec<AcpMcpServerSpec>,
+    ) -> Result<DaemonSession> {
         let (reader, writer) = self.connect_daemon().await?;
         let session = DaemonSession::new(String::new(), reader, writer, 2);
         let subscribe_id = 1;
@@ -797,6 +802,59 @@ impl AcpRuntime {
             ),
             other => anyhow::bail!("expected history after session creation, got {other:?}"),
         };
+        // Session-scoped MCP servers (ACP's own `mcpServers`, Phase 3 item
+        // #7): connect each on this same daemon connection, before handing
+        // the session back to the client, so a tool call the client makes
+        // immediately after `session/new` returns can already see them.
+        // Fail-soft per server, matching `validate_acp_mcp_servers`'s own
+        // "don't reject the session over this" stance -- one bad server
+        // config shouldn't take down session creation for the rest.
+        //
+        // Gemini review, 2026-08-30: sequential + unbounded `wait_for_done`
+        // meant one hanging MCP server subprocess (bad handshake, waiting on
+        // stdin, etc.) would block `session/new` indefinitely -- likely
+        // outlasting the ACP host's own request timeout. Each connect now
+        // gets a bounded wait; a timeout is reported and skipped, not left
+        // to hang the whole session. Sequential dispatch (not concurrent)
+        // is kept deliberately: the daemon processes one client request at
+        // a time per connection, so true concurrency here would need the
+        // server-side handler to be spawned rather than awaited -- a larger
+        // change than this slice's scope.
+        const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+        for server in mcp_servers {
+            let request_id = session.next_id();
+            let name = server.name.clone();
+            let send_result = session
+                .send(&Request::McpConnectServer {
+                    id: request_id,
+                    server: server.name,
+                    command: server.command,
+                    args: server.args,
+                    env: server.env,
+                })
+                .await;
+            if let Err(err) = send_result {
+                crate::logging::warn(&format!(
+                    "ACP session/new: failed to send mcp connect request for '{name}': {err:#}"
+                ));
+                continue;
+            }
+            match tokio::time::timeout(MCP_CONNECT_TIMEOUT, wait_for_done(&session, request_id))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    crate::logging::warn(&format!(
+                        "ACP session/new: mcp server '{name}' failed to connect: {err:#}"
+                    ));
+                }
+                Err(_) => {
+                    crate::logging::warn(&format!(
+                        "ACP session/new: mcp server '{name}' timed out connecting after {MCP_CONNECT_TIMEOUT:?}, skipping"
+                    ));
+                }
+            }
+        }
         Ok(DaemonSession::new(
             session_id,
             session.reader.into_inner().into_inner(),
@@ -1691,11 +1749,73 @@ fn required_session_id(params: &Value) -> std::result::Result<String, String> {
 fn validate_acp_mcp_servers(params: &Value) -> std::result::Result<(), String> {
     match params.get("mcpServers") {
         None | Some(Value::Null) => Ok(()),
-        // Session-scoped MCP is not supported yet, but rejecting this required
-        // ACP field prevents hosts with MCP servers from creating a session.
         Some(Value::Array(_)) => Ok(()),
         Some(_) => Err("ACP mcpServers must be an array".to_string()),
     }
+}
+
+/// One entry of ACP's `session/new` `mcpServers` array, ready to connect.
+/// Assumed shape: `{name, command, args?, env?}` with `env` as a plain
+/// string->string object -- the same convention jcode's own `.mcp.json`/
+/// `McpServerConfig` and the `mcp` tool's own ad-hoc `connect` action
+/// already use. **Not yet verified against a real ACP host** (no live
+/// client has exercised this path) -- if a real host sends `env` as an
+/// array of `{name, value}` pairs instead, this will silently see an empty
+/// env for that server rather than fail the session; worth revisiting once
+/// a real host is tested against.
+struct AcpMcpServerSpec {
+    name: String,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+/// Parse `mcpServers` into connectable specs, tolerating individual bad
+/// entries rather than failing the whole `session/new` call -- matches
+/// `validate_acp_mcp_servers`'s own "don't reject the session over this"
+/// stance. An entry missing `name` or `command` (the two fields jcode's
+/// `mcp connect` action actually requires) is skipped, not an error.
+fn parse_acp_mcp_servers(params: &Value) -> Vec<AcpMcpServerSpec> {
+    let Some(Value::Array(entries)) = params.get("mcpServers") else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?.trim();
+            let command = entry.get("command")?.as_str()?.trim();
+            if name.is_empty() || command.is_empty() {
+                return None;
+            }
+            let args = entry
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let env = entry
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AcpMcpServerSpec {
+                name: name.to_string(),
+                command: command.to_string(),
+                args,
+                env,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1999,12 +2119,80 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_mcp_servers_are_tolerated_until_session_scoped_mcp_is_supported() {
+    fn validate_acp_mcp_servers_accepts_any_array_shape() {
+        // validate_acp_mcp_servers only checks "is this an array at all" --
+        // per-entry validity is parse_acp_mcp_servers's job (below), which
+        // tolerates bad entries by skipping them rather than by accepting
+        // anything here. A malformed entry (missing "command") is still a
+        // valid *array element* as far as this function is concerned.
         let params = json!({"mcpServers": [{"name": "fs"}]});
         assert!(validate_acp_mcp_servers(&params).is_ok());
 
         let params = json!({"mcpServers": []});
         assert!(validate_acp_mcp_servers(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_acp_mcp_servers_rejects_a_non_array() {
+        let params = json!({"mcpServers": "fs"});
+        assert!(validate_acp_mcp_servers(&params).is_err());
+    }
+
+    #[test]
+    fn parse_acp_mcp_servers_extracts_valid_entries() {
+        let params = json!({
+            "mcpServers": [
+                {
+                    "name": "fs",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                    "env": {"DEBUG": "1"}
+                },
+                {"name": "bare", "command": "bare-server"}
+            ]
+        });
+        let servers = parse_acp_mcp_servers(&params);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "fs");
+        assert_eq!(servers[0].command, "npx");
+        assert_eq!(
+            servers[0].args,
+            vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string()
+            ]
+        );
+        assert_eq!(servers[0].env.get("DEBUG"), Some(&"1".to_string()));
+        // No args/env at all is fine -- both default to empty, not an error.
+        assert_eq!(servers[1].name, "bare");
+        assert!(servers[1].args.is_empty());
+        assert!(servers[1].env.is_empty());
+    }
+
+    #[test]
+    fn parse_acp_mcp_servers_skips_entries_missing_required_fields() {
+        let params = json!({
+            "mcpServers": [
+                {"name": "no-command"},
+                {"command": "no-name"},
+                {"name": "", "command": "blank-name"},
+                {"name": "blank-command", "command": "  "},
+                {"name": "good", "command": "good-server"}
+            ]
+        });
+        // Only the one fully-valid entry survives -- the four malformed
+        // ones are silently skipped, not treated as an error (matches
+        // validate_acp_mcp_servers's own "don't reject the session" stance).
+        let servers = parse_acp_mcp_servers(&params);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "good");
+    }
+
+    #[test]
+    fn parse_acp_mcp_servers_returns_empty_for_absent_or_non_array_field() {
+        assert!(parse_acp_mcp_servers(&json!({})).is_empty());
+        assert!(parse_acp_mcp_servers(&json!({"mcpServers": null})).is_empty());
+        assert!(parse_acp_mcp_servers(&json!({"mcpServers": "not-an-array"})).is_empty());
     }
 
     #[test]

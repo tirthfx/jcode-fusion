@@ -385,6 +385,69 @@ pub(super) fn handle_run_subagent(
     });
 }
 
+/// Connect an MCP server to the active connection's own session, without a
+/// full agent turn -- e.g. an ACP client's `session/new`-scoped `mcpServers`
+/// (Phase 3, ACP session-scoped MCP support). Reuses the existing `mcp`
+/// tool's own `connect` action (`tool/mcp.rs`) via a direct (non-turn)
+/// invocation -- the same `ToolExecutionMode::Direct` pattern
+/// `handle_run_subagent` above already uses, and deliberately not
+/// session_id-targeted for the same reason: this always applies to this
+/// connection's own session, resolved from `agent` directly.
+///
+/// Unlike `handle_run_subagent`, this does **not** persist a synthetic tool
+/// call into the session's own message history -- this is session-setup
+/// plumbing running before any real conversation has started, not something
+/// the agent itself did.
+pub(super) async fn handle_mcp_connect_server(
+    id: u64,
+    server: String,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let (registry, session_id, working_dir) = {
+        let agent_guard = agent.lock().await;
+        (
+            agent_guard.registry(),
+            agent_guard.session_id().to_string(),
+            agent_guard.working_dir().map(std::path::PathBuf::from),
+        )
+    };
+
+    let ctx = crate::tool::ToolContext {
+        session_id,
+        message_id: crate::id::new_id("message"),
+        tool_call_id: crate::id::new_id("call"),
+        working_dir,
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::Direct,
+    };
+
+    let tool_input = serde_json::json!({
+        "action": "connect",
+        "server": server,
+        "command": command,
+        "args": args,
+        "env": env,
+    });
+
+    match registry.execute("mcp", tool_input, ctx).await {
+        Ok(_) => {
+            let _ = client_event_tx.send(ServerEvent::Done { id });
+        }
+        Err(error) => {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: crate::util::format_error_chain(&error),
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "set feature mutates agent state, persistence, swarm/session metadata, and client notifications together"

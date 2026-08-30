@@ -270,6 +270,25 @@ pub enum Request {
         session_id: Option<String>,
     },
 
+    /// Connect an MCP server to the active session's own (already per-session)
+    /// `McpManager`, without a full agent turn -- e.g. an ACP client's
+    /// `session/new`-scoped `mcpServers`, connected before the session is
+    /// handed back to that client. Reuses the existing `mcp` tool's own
+    /// `connect` action (`tool/mcp.rs`) via a direct (non-turn) tool
+    /// invocation, the same "ambient current agent" pattern `RunSubagent`
+    /// already uses -- deliberately not session_id-targeted, since (like
+    /// `RunSubagent`) this always applies to the connection's own session.
+    #[serde(rename = "mcp_connect_server")]
+    McpConnectServer {
+        id: u64,
+        server: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        env: std::collections::HashMap<String, String>,
+    },
+
     /// Set reasoning effort for providers that expose it (OpenAI: none|minimal|low|medium|high|xhigh|max; Anthropic: none|low|medium|high|xhigh|max; DeepSeek: none|low|medium|high|max)
     #[serde(rename = "set_reasoning_effort")]
     SetReasoningEffort {
