@@ -55,6 +55,7 @@ pub mod swarm_worktree;
 pub mod tool;
 pub mod turn_cancel_registry;
 pub mod update;
+pub mod workflow_template;
 
 use std::sync::Mutex;
 
