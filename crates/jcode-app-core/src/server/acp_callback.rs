@@ -10,18 +10,12 @@
 //! uses (`ServerEvent::AcpCallbackRequest` out, `Request::AcpCallbackResponse`
 //! back).
 //!
-//! **Deliberately just this half of the plumbing, same "smallest coherent
-//! slice" shape as the adapter-side one**: `send_acp_callback` has **no
-//! real caller yet**. The daemon-side tools that would actually need this
-//! (`WriteTool`/`ReadTool`, today calling `tokio::fs::write`/`read`
-//! directly, in-process, unconditionally) aren't touched here -- routing
-//! their I/O through this callback only when a session is ACP-connected is
-//! real, separate, higher-blast-radius work (those tools run for every
-//! session type, TUI and headless included; a wiring mistake there risks
-//! regressing all of them, not just ACP ones). This module exists so that
-//! future wiring has a already-built, already-tested primitive to call,
-//! rather than needing to invent the callback mechanism itself under time
-//! pressure once someone actually starts that riskier change.
+//! `WriteTool`/`ReadTool` (`tool/write.rs`/`tool/read.rs`) now call
+//! `send_acp_callback_for_session`/`is_acp_session` directly -- the real
+//! wiring this module was originally built ahead of. A non-ACP session's
+//! behavior in those tools is untouched (same `tokio::fs` calls as always);
+//! an ACP-connected session's primary file read/write routes through this
+//! relay instead.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -33,7 +27,7 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::protocol::ServerEvent;
 
-use super::SwarmMember;
+use super::{ClientConnectionInfo, SwarmMember};
 
 type PendingAcpCallbacks =
     Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value, Value>>>>;
@@ -142,35 +136,240 @@ pub fn resolve_acp_callback(id: u64, result: std::result::Result<Value, Value>) 
     }
 }
 
+// --- Real caller support: which sessions are ACP-connected, and a
+// no-swarm_members-needed entry point for callers (WriteTool/ReadTool)
+// that don't have direct access to it. ---
+
+type SwarmMembers = Arc<RwLock<HashMap<String, SwarmMember>>>;
+
+/// The one shared static both `register_swarm_members` and
+/// `registered_swarm_members` must use -- a real bug caught while writing
+/// this (before it ever shipped): an earlier draft gave each function its
+/// *own* function-local `static`, which are genuinely distinct statics even
+/// with the same name, so a `set` from one would never be visible to a
+/// `get` from the other. A single module-level static is the only way
+/// these two functions actually share the same cell.
+static REGISTERED_SWARM_MEMBERS: OnceLock<SwarmMembers> = OnceLock::new();
+
+fn registered_swarm_members() -> Option<&'static SwarmMembers> {
+    // `get_or_init` isn't used here (unlike `pending_callbacks`) because
+    // this needs to be *set* once from `Server::new` with the real,
+    // already-constructed map, not lazily built with an empty one the
+    // server would never actually use -- `OnceLock::get` after a
+    // conditional `set` is the right shape for "may not be registered
+    // yet" (e.g. a tool call racing server startup, vanishingly unlikely
+    // in practice but not something to assume away).
+    REGISTERED_SWARM_MEMBERS.get()
+}
+
+/// Register the running server's own `swarm_members` map. Called once from
+/// `Server::new`. **A real limit, verified not guessed**: production reload
+/// is a full `exec()` process replacement (`platform::replace_process`,
+/// confirmed by reading it directly) -- a genuinely fresh process, so this
+/// static starts over cleanly there. The one place multiple `Server`
+/// instances *do* coexist in one process is this crate's own test suite
+/// (`server/tests.rs`, `server/startup_tests.rs` each construct their own);
+/// none of those currently exercise ACP callback behavior, so this is a
+/// real, latent limitation of the "one global slot" design, not (yet) an
+/// active bug -- flagged honestly rather than the earlier draft's
+/// overconfident "never happens."
+pub fn register_swarm_members(members: SwarmMembers) {
+    let _ = REGISTERED_SWARM_MEMBERS.set(members);
+}
+
+type ClientConnections = Arc<RwLock<HashMap<String, ClientConnectionInfo>>>;
+
+static REGISTERED_CLIENT_CONNECTIONS: OnceLock<ClientConnections> = OnceLock::new();
+
+fn registered_client_connections() -> Option<&'static ClientConnections> {
+    REGISTERED_CLIENT_CONNECTIONS.get()
+}
+
+/// Register the running server's own `client_connections` map, alongside
+/// [`register_swarm_members`] (same call site, same lifetime, same
+/// one-process-per-registration limit documented there).
+pub fn register_client_connections(connections: ClientConnections) {
+    let _ = REGISTERED_CLIENT_CONNECTIONS.set(connections);
+}
+
+/// Whether `session_id` is *currently* ACP-connected -- the check
+/// `WriteTool`/`ReadTool` use to decide whether to route through
+/// `send_acp_callback_for_session` at all.
+///
+/// **Rewritten after a Gemini review found the original design genuinely
+/// broken, not shipped as first written**: the original approach was a
+/// sticky, mark-once `HashSet<String>`, set when a session was created via
+/// ACP and never cleared. That has a real, production-triggerable failure
+/// mode: if an ACP client disconnects and a *different* client (a TUI, most
+/// commonly) later resumes that exact session id via `session/resume`, the
+/// stale mark would still route that TUI session's every file write/read
+/// through a callback aimed at a client that has no idea what
+/// `fs/read_text_file` even means -- every file operation on that session
+/// would hang for the full timeout and then fail, for a perfectly ordinary
+/// TUI session, until the process restarts. A background swarm worker
+/// outliving an ACP client's own disconnect would hit the identical
+/// failure.
+///
+/// Fixed by checking the *live* connection state instead of a persisted
+/// mark: `client_connections` already tracks `client_instance_id` per
+/// connection, updated correctly on every connect/resume/disconnect by
+/// code this slice doesn't touch at all (jcode's own existing connection
+/// lifecycle management) -- reusing it instead of inventing parallel,
+/// independently-stale-able tracking. This also means `Request::
+/// MarkAcpSession` (the original design's own marking mechanism) is no
+/// longer needed at all: ACP-ness is now derived from data the existing
+/// `Subscribe` handling already records, not something a *separate* step
+/// has to remember to set.
+pub async fn is_acp_session(session_id: &str) -> bool {
+    let Some(connections) = registered_client_connections() else {
+        return false;
+    };
+    connections
+        .read()
+        .await
+        .values()
+        .any(|info| info.session_id == session_id && info.client_instance_id.as_deref() == Some("acp"))
+}
+
+/// `send_acp_callback` for a caller (`WriteTool`/`ReadTool`) that doesn't
+/// have `swarm_members` threaded to it at all -- resolves it from the
+/// process-wide registration instead. Fails with a clear error (never
+/// panics) if the server hasn't registered its map yet, or the session
+/// isn't actually ACP-connected -- callers are expected to check
+/// [`is_acp_session`] first and only call this when it returned `true`;
+/// this function re-checks `send_acp_callback`'s own "session has no live
+/// connection" case regardless, so it's still safe to call without that
+/// check, just less informative about *why* it failed.
+pub async fn send_acp_callback_for_session(
+    session_id: &str,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let Some(members) = registered_swarm_members() else {
+        anyhow::bail!("ACP callback dispatcher not initialized (server not fully started?)");
+    };
+    send_acp_callback(session_id, method, params, timeout, members).await
+}
+
+/// Test-only accessor for the registered `swarm_members` map, tolerant of
+/// `register_swarm_members` already having been called earlier in this same
+/// test binary run (a real constraint, not an oversight: `OnceLock::set`
+/// only ever succeeds once per process, and `cargo test` runs every test in
+/// this crate inside one process). Callers in `tool/write.rs`'s and
+/// `tool/read.rs`'s own tests use unique, never-reused session ids when
+/// inserting into whatever map this returns, so tests sharing one
+/// underlying map (whichever test happened to register it first) never
+/// collide with each other.
+///
+/// **A real hang, reproduced then fixed, not just theorized**: an earlier
+/// version returned its own locally-built map whenever `set` lost the race
+/// against a concurrently-running test doing the same thing (`cargo test`
+/// runs different test functions on different OS threads by default) --
+/// `OnceLock::set` failing is silent (`let _ = ...`), so the loser walked
+/// away holding a map the production code (`send_acp_callback_for_session`,
+/// which only ever reads the *actual* registered global) could never see.
+/// That test's session id was then invisible to `send_acp_callback`, which
+/// failed fast with "no live connection" *without ever sending the event*
+/// -- and the test was still blocked on `event_rx.recv().await`, which
+/// blocks forever rather than erroring, since its sending half was alive
+/// but simply never used. Reproduced directly: `tool::write`'s and
+/// `tool::read`'s ACP-routing tests run in ~0.00s individually, but hung
+/// indefinitely when run together (their natural, default `cargo test`
+/// scheduling). Fixed by re-reading the *actual* global after attempting to
+/// set it, regardless of whether this call won the race -- every caller
+/// now provably shares the one true map, never a stale local one.
+#[cfg(test)]
+pub(crate) fn ensure_swarm_members_registered_for_test() -> SwarmMembers {
+    if let Some(existing) = registered_swarm_members() {
+        return Arc::clone(existing);
+    }
+    let members: SwarmMembers = Arc::new(RwLock::new(HashMap::new()));
+    let _ = REGISTERED_SWARM_MEMBERS.set(members);
+    Arc::clone(
+        registered_swarm_members()
+            .expect("just set it ourselves, or another thread already had"),
+    )
+}
+
+/// Same tolerance -- and the same real race-to-hang fix -- as
+/// [`ensure_swarm_members_registered_for_test`], for `client_connections`:
+/// `is_acp_session`'s own real backing store now that it checks live
+/// connection state instead of a sticky mark.
+#[cfg(test)]
+pub(crate) fn ensure_client_connections_registered_for_test() -> ClientConnections {
+    if let Some(existing) = registered_client_connections() {
+        return Arc::clone(existing);
+    }
+    let connections: ClientConnections = Arc::new(RwLock::new(HashMap::new()));
+    let _ = REGISTERED_CLIENT_CONNECTIONS.set(connections);
+    Arc::clone(
+        registered_client_connections()
+            .expect("just set it ourselves, or another thread already had"),
+    )
+}
+
+/// A minimal, real `ClientConnectionInfo` marking `session_id` as
+/// ACP-connected, for tests exercising `is_acp_session`/
+/// `send_acp_callback_for_session` end to end (`tool/write.rs`'s and
+/// `tool/read.rs`'s own tests, plus this module's own).
+#[cfg(test)]
+pub(crate) fn test_acp_client_connection(session_id: &str) -> ClientConnectionInfo {
+    let (disconnect_tx, _disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+    ClientConnectionInfo {
+        client_id: format!("client-for-{session_id}"),
+        session_id: session_id.to_string(),
+        client_instance_id: Some("acp".to_string()),
+        debug_client_id: None,
+        connected_at: std::time::Instant::now(),
+        last_seen: std::time::Instant::now(),
+        is_processing: false,
+        current_tool_name: None,
+        terminal_env: Vec::new(),
+        disconnect_tx,
+    }
+}
+
+/// A minimal, real `SwarmMember` for tests -- reusable outside this module
+/// (`tool/write.rs`'s and `tool/read.rs`'s own tests need one too, to
+/// exercise `send_acp_callback_for_session`/`is_acp_session` end to end).
+/// Moved to module scope rather than duplicated per test module.
+#[cfg(test)]
+pub(crate) fn test_swarm_member(
+    session_id: &str,
+    event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
+) -> SwarmMember {
+    SwarmMember {
+        session_id: session_id.to_string(),
+        event_tx,
+        event_txs: HashMap::new(),
+        working_dir: None,
+        swarm_id: None,
+        swarm_enabled: false,
+        status: "running".to_string(),
+        detail: None,
+        task_label: None,
+        friendly_name: None,
+        report_back_to_session_id: None,
+        latest_completion_report: None,
+        role: "agent".to_string(),
+        joined_at: std::time::Instant::now(),
+        last_status_change: std::time::Instant::now(),
+        is_headless: true,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: Default::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap as StdHashMap;
     use tokio::sync::mpsc;
 
     fn test_member(event_tx: mpsc::UnboundedSender<ServerEvent>) -> SwarmMember {
-        SwarmMember {
-            session_id: "sess-1".to_string(),
-            event_tx,
-            event_txs: StdHashMap::new(),
-            working_dir: None,
-            swarm_id: None,
-            swarm_enabled: false,
-            status: "running".to_string(),
-            detail: None,
-            task_label: None,
-            friendly_name: None,
-            report_back_to_session_id: None,
-            latest_completion_report: None,
-            role: "agent".to_string(),
-            joined_at: std::time::Instant::now(),
-            last_status_change: std::time::Instant::now(),
-            is_headless: true,
-            output_tail: None,
-            todo_progress: None,
-            todo_items: Vec::new(),
-            runtime: Default::default(),
-        }
+        test_swarm_member("sess-1", event_tx)
     }
 
     #[tokio::test]

@@ -187,8 +187,24 @@ impl Tool for ReadTool {
             )));
         }
 
-        // Read file
-        let content = tokio::fs::read_to_string(&path).await?;
+        // Read file. Fusion Phase 3, ACP client-callback delegation, real
+        // wiring: an ACP-connected session's primary text read is routed
+        // through the ACP host's own `fs/read_text_file` instead of this
+        // process's own disk view -- the host may hold this exact file
+        // open with unsaved editor changes a direct disk read would miss.
+        // Deliberately scoped to just this one call, the same "smallest
+        // coherent slice" limit `write.rs`'s own wiring took: the
+        // pre-flight `path.exists()` check above and the image/PDF/binary
+        // detection paths below still consult the local filesystem
+        // directly, not routed through the callback -- a real, honest gap
+        // (a file that exists only in the host's live buffer, never saved
+        // to disk, would still hit "File not found" here before ever
+        // reaching this line), not silently pretended fully covered.
+        let content = if crate::server::acp_callback::is_acp_session(&ctx.session_id).await {
+            acp_read_text_file(&ctx.session_id, &path).await?
+        } else {
+            tokio::fs::read_to_string(&path).await?
+        };
 
         // Single-pass: count lines while building output
         let mut output = String::with_capacity(range.limit.min(2000) * 80);
@@ -327,6 +343,42 @@ fn find_similar_files(path: &Path) -> Vec<String> {
     }
 
     suggestions
+}
+
+/// How long to wait for the ACP host to answer a file-read callback.
+/// Shorter than `session/request_permission`'s own 120s (`src/cli/acp.rs`)
+/// -- a file read shouldn't need a human in the loop, so a slow answer here
+/// is much more likely a stuck host than someone thinking.
+const ACP_READ_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read a file's current content via the ACP host's own `fs/read_text_file`
+/// (Phase 3, client-callback delegation) rather than this process's own
+/// filesystem view. Unlike `write.rs`'s own read-for-diff-preview helper
+/// (tolerant of any failure, since a diff preview is best-effort), a
+/// genuine read failure here propagates as a real tool error -- this *is*
+/// the read the tool call is actually for, not an optional side detail.
+///
+/// **Wire shape not yet verified against a real ACP host** -- this
+/// project's standing biggest unverified assumption applies here too:
+/// `{"path", "sessionId"}` in, `{"content"}` out is this implementation's
+/// best-effort reading of the protocol, not confirmed interop.
+async fn acp_read_text_file(session_id: &str, path: &Path) -> Result<String> {
+    let params = json!({
+        "path": path.display().to_string(),
+        "sessionId": session_id,
+    });
+    let result = crate::server::acp_callback::send_acp_callback_for_session(
+        session_id,
+        "fs/read_text_file",
+        params,
+        ACP_READ_CALLBACK_TIMEOUT,
+    )
+    .await?;
+    result
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("ACP host's fs/read_text_file response had no 'content' field"))
 }
 
 /// Check if a file is an image based on extension

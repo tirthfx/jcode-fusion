@@ -937,6 +937,7 @@ impl AcpRuntime {
                 }
             }
         }
+
         Ok(DaemonSession::new(
             session_id,
             session.reader.into_inner().into_inner(),

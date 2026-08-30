@@ -59,23 +59,50 @@ impl Tool for WriteTool {
 
         let path = ctx.resolve_path(Path::new(&params.file_path));
 
-        // Create parent directories if needed
+        // Create parent directories if needed. Common to both paths below --
+        // an empty directory's existence doesn't clash with any editor
+        // buffer state an ACP host might be holding, unlike the file's own
+        // content.
         if let Some(parent) = path.parent()
             && !parent.exists()
         {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Check if file existed before and read old content for diff
-        let existed = path.exists();
-        let old_content = if existed {
-            tokio::fs::read_to_string(&path).await.ok()
+        // Fusion Phase 3, ACP client-callback delegation, real wiring: when
+        // this session is ACP-connected, route both the "read old content
+        // for the diff" and the actual write through the ACP host
+        // (`fs/read_text_file`/`fs/write_text_file`) instead of touching
+        // the filesystem directly in-process. This is the whole point of
+        // the relay, not an incidental detail: the host may have this
+        // exact file open with unsaved editor changes, which a direct
+        // `tokio::fs::write` would silently clobber and a direct
+        // `tokio::fs::read_to_string` would silently miss (reading stale
+        // on-disk content instead of the host's live buffer). A non-ACP
+        // session's behavior below is completely unchanged -- same calls,
+        // same order, same tolerance for a read failure meaning "treat as
+        // a new file."
+        let is_acp = crate::server::acp_callback::is_acp_session(&ctx.session_id).await;
+
+        let (existed, old_content) = if is_acp {
+            acp_read_existing_content(&ctx.session_id, &path).await
         } else {
-            None
+            // Check if file existed before and read old content for diff
+            let existed = path.exists();
+            let old_content = if existed {
+                tokio::fs::read_to_string(&path).await.ok()
+            } else {
+                None
+            };
+            (existed, old_content)
         };
 
         // Write the file
-        tokio::fs::write(&path, &params.content).await?;
+        if is_acp {
+            acp_write_content(&ctx.session_id, &path, &params.content).await?;
+        } else {
+            tokio::fs::write(&path, &params.content).await?;
+        }
 
         let _new_len = params.content.len();
         let line_count = params.content.lines().count();
@@ -132,6 +159,77 @@ impl Tool for WriteTool {
 
         Ok(ToolOutput::new(body).with_title(params.file_path.clone()))
     }
+}
+
+/// How long to wait for the ACP host to answer a file read/write callback.
+/// Shorter than `session/request_permission`'s own 120s (`src/cli/acp.rs`)
+/// on purpose -- a file operation shouldn't need a human in the loop, so a
+/// slow answer here is much more likely a stuck host than someone thinking,
+/// and callers (an agent turn waiting on this tool call) shouldn't be held
+/// open for minutes over what's meant to be routine I/O.
+const ACP_FILE_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read a file's current content via the ACP host's own `fs/read_text_file`
+/// (Phase 3, client-callback delegation), rather than this process's own
+/// filesystem view -- the host may hold this exact file open with unsaved
+/// editor changes a direct disk read would miss entirely.
+///
+/// **Wire shape not yet verified against a real ACP host** -- this project's
+/// standing biggest unverified assumption applies here specifically: no
+/// live ACP client has exercised this path. `{"path", "sessionId"}` in,
+/// `{"content"}` out is this implementation's best-effort reading of the
+/// protocol, not confirmed interop.
+///
+/// Tolerant on any failure (missing file, host error, timeout) -- treated
+/// identically to the non-ACP path's own `.ok()` on `read_to_string`, which
+/// also silently swallows every read failure (not just "not found") as
+/// "no old content, this is effectively a new file."
+async fn acp_read_existing_content(session_id: &str, path: &Path) -> (bool, Option<String>) {
+    let params = json!({
+        "path": path.display().to_string(),
+        "sessionId": session_id,
+    });
+    let result = crate::server::acp_callback::send_acp_callback_for_session(
+        session_id,
+        "fs/read_text_file",
+        params,
+        ACP_FILE_CALLBACK_TIMEOUT,
+    )
+    .await;
+    match result {
+        Ok(value) => {
+            let content = value
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            (content.is_some(), content)
+        }
+        Err(_) => (false, None),
+    }
+}
+
+/// Write `content` via the ACP host's own `fs/write_text_file`, so an open,
+/// unsaved editor buffer for this file gets the host's own save semantics
+/// rather than being silently overwritten by a direct disk write underneath
+/// it. Same "wire shape not yet verified against a real host" caveat as
+/// [`acp_read_existing_content`]. Unlike the read side, a write failure
+/// propagates as a real tool error -- silently pretending a write succeeded
+/// when it didn't would be a correctness problem, not just a missed
+/// diff-preview nicety.
+async fn acp_write_content(session_id: &str, path: &Path, content: &str) -> Result<()> {
+    let params = json!({
+        "path": path.display().to_string(),
+        "content": content,
+        "sessionId": session_id,
+    });
+    crate::server::acp_callback::send_acp_callback_for_session(
+        session_id,
+        "fs/write_text_file",
+        params,
+        ACP_FILE_CALLBACK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Generate a compact diff: "42- old" / "42+ new" (max 20 lines)
@@ -214,6 +312,7 @@ fn build_file_touch_preview(diff: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolExecutionMode;
 
     #[test]
     fn test_generate_diff_summary_single_change() {
@@ -292,5 +391,104 @@ mod tests {
         let diff = generate_diff_summary(old, new);
 
         assert!(diff.is_empty(), "No changes should produce empty diff");
+    }
+
+    // --- ACP client-callback delegation (Phase 3, real wiring) ---
+
+    fn make_ctx(session_id: &str, working_dir: std::path::PathBuf) -> ToolContext {
+        ToolContext {
+            session_id: session_id.to_string(),
+            message_id: "test-message".to_string(),
+            tool_call_id: "test-call".to_string(),
+            working_dir: Some(working_dir),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_tool_routes_through_acp_callback_for_an_acp_connected_session() {
+        // Proves the ACP-routed path actually goes through the relay end
+        // to end, not just that the branch condition compiles: this
+        // session never touches the real filesystem at all -- both the
+        // pre-write read and the write itself are answered entirely via
+        // simulated ACP host responses, and the test asserts the file
+        // never actually landed on disk.
+        let session_id = "acp-write-test-session";
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let members = crate::server::acp_callback::ensure_swarm_members_registered_for_test();
+        members.write().await.insert(
+            session_id.to_string(),
+            crate::server::acp_callback::test_swarm_member(session_id, event_tx),
+        );
+        let connections = crate::server::acp_callback::ensure_client_connections_registered_for_test();
+        connections.write().await.insert(
+            session_id.to_string(),
+            crate::server::acp_callback::test_acp_client_connection(session_id),
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ctx = make_ctx(session_id, temp.path().to_path_buf());
+        let input = json!({
+            "file_path": "new_file.txt",
+            "content": "hello from acp\n",
+        });
+
+        let call = tokio::spawn(async move { WriteTool::new().execute(input, ctx).await });
+
+        // First callback: the pre-write "read old content" check. Answer
+        // with no `content` field -- the write-tool side treats that as
+        // "doesn't exist", matching a brand-new file.
+        let event = event_rx.recv().await.expect("read callback sent");
+        let crate::protocol::ServerEvent::AcpCallbackRequest { id, method, params } = event else {
+            panic!("expected AcpCallbackRequest, got {event:?}");
+        };
+        assert_eq!(method, "fs/read_text_file");
+        assert!(params["path"].as_str().unwrap().ends_with("new_file.txt"));
+        crate::server::acp_callback::resolve_acp_callback(id, Ok(json!({})));
+
+        // Second callback: the actual write.
+        let event = event_rx.recv().await.expect("write callback sent");
+        let crate::protocol::ServerEvent::AcpCallbackRequest { id, method, params } = event else {
+            panic!("expected AcpCallbackRequest, got {event:?}");
+        };
+        assert_eq!(method, "fs/write_text_file");
+        assert_eq!(params["content"], "hello from acp\n");
+        crate::server::acp_callback::resolve_acp_callback(id, Ok(json!({})));
+
+        let output = call
+            .await
+            .expect("task")
+            .expect("execute should succeed");
+        assert!(output.output.contains("Created"));
+
+        // The whole point: this must never have touched the real disk.
+        assert!(
+            !temp.path().join("new_file.txt").exists(),
+            "the write must have gone through the ACP callback, not the local filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_still_writes_locally_for_a_non_acp_session() {
+        // The other half of "provably unaffected": a session never marked
+        // ACP must still behave exactly as before this slice -- a real
+        // local write, no callback involved at all.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ctx = make_ctx("not-an-acp-session", temp.path().to_path_buf());
+        let input = json!({
+            "file_path": "plain_file.txt",
+            "content": "hello from disk\n",
+        });
+
+        WriteTool::new()
+            .execute(input, ctx)
+            .await
+            .expect("execute should succeed");
+
+        let written = std::fs::read_to_string(temp.path().join("plain_file.txt"))
+            .expect("file must exist locally");
+        assert_eq!(written, "hello from disk\n");
     }
 }

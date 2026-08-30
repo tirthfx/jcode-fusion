@@ -43,10 +43,16 @@ pub(super) struct ClientDebugState {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ClientConnectionInfo {
+// `pub(crate)`, not `pub(super)`: `server/acp_callback.rs` needs
+// `session_id`/`client_instance_id` to answer "is this session currently
+// ACP-connected?" live, rather than the earlier (removed) sticky
+// mark-once-on-creation approach, which a Gemini review found genuinely
+// broken across a session's own disconnect/resume lifecycle -- see
+// `acp_callback::is_acp_session`'s own doc comment for the full story.
+pub(crate) struct ClientConnectionInfo {
     pub(super) client_id: String,
-    pub(super) session_id: String,
-    pub(super) client_instance_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) client_instance_id: Option<String>,
     pub(super) debug_client_id: Option<String>,
     pub(super) connected_at: Instant,
     pub(super) last_seen: Instant,

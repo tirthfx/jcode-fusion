@@ -1,4 +1,12 @@
-mod acp_callback;
+// `pub(crate)`, not private like every sibling `mod` below: `tool/write.rs`
+// and `tool/read.rs` (a different module tree entirely, not a descendant of
+// `server`) need `is_acp_session`/`send_acp_callback_for_session` to decide
+// whether to route their I/O through this relay. The module's own contents
+// still control their individual visibility (only the two functions those
+// tools actually need are `pub`); this just makes the module itself
+// reachable from outside `server`, the same reason `Bus` (jcode-base) lives
+// somewhere globally reachable rather than nested inside one subsystem.
+pub(crate) mod acp_callback;
 mod available_models_dedup;
 mod await_members_state;
 mod background_tasks;
@@ -817,7 +825,7 @@ impl Server {
             swarms_by_id: restored_swarms_by_id,
         } = load_persisted_swarm_runtime_state();
 
-        Self {
+        let server = Self {
             provider,
             socket_path: socket_path(),
             debug_socket_path: debug_socket_path(),
@@ -851,7 +859,38 @@ impl Server {
             soft_interrupt_queues: Arc::new(RwLock::new(HashMap::new())),
             await_members_runtime: AwaitMembersRuntime::default(),
             swarm_mutation_runtime: SwarmMutationRuntime::default(),
-        }
+        };
+        // Fusion Phase 3, ACP client-callback delegation: register this
+        // server's own swarm_members + client_connections maps once, so
+        // code with no direct access to them (deliberately:
+        // `tool/write.rs`/`tool/read.rs`, which run in a different module
+        // tree entirely and shouldn't need a whole `Server` reference
+        // threaded to them just to check "is my session ACP-connected")
+        // can still reach `send_acp_callback`/`is_acp_session` via
+        // `acp_callback`'s own crate-visible functions. A real, deliberate
+        // departure from this codebase's usual explicit-constructor-
+        // injection convention -- `OnceLock`-based process-wide singletons
+        // already have one precedent here (`Bus::global()`, jcode-base).
+        //
+        // **Verified limit, not an assumed one**: production reload is a
+        // full `exec()` process replacement (`platform::replace_process`,
+        // read directly before relying on this), so this static starts
+        // fresh there -- safe. Multiple `Server` instances *do* coexist
+        // within one process in this crate's own test suite
+        // (`server/tests.rs`, `server/startup_tests.rs`); none of those
+        // currently exercise ACP callback behavior, so a stale registration
+        // from an earlier test's `Server` is a real, latent limitation of
+        // this "one global slot" design, not (yet) an active bug -- see
+        // `acp_callback.rs`'s own doc comments for the fuller account
+        // (a Gemini review flagged this after an earlier, overconfident
+        // version of this comment claimed it "never happens").
+        crate::server::acp_callback::register_swarm_members(Arc::clone(
+            &server.swarm_state.members,
+        ));
+        crate::server::acp_callback::register_client_connections(Arc::clone(
+            &server.client_connections,
+        ));
+        server
     }
 
     pub fn new_with_paths(

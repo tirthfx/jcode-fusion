@@ -3,8 +3,12 @@ use crate::tool::{ToolContext, ToolExecutionMode};
 use serde_json::json;
 
 fn make_ctx(working_dir: std::path::PathBuf) -> ToolContext {
+    make_ctx_with_session("test-session", working_dir)
+}
+
+fn make_ctx_with_session(session_id: &str, working_dir: std::path::PathBuf) -> ToolContext {
     ToolContext {
-        session_id: "test-session".to_string(),
+        session_id: session_id.to_string(),
         message_id: "test-message".to_string(),
         tool_call_id: "test-call".to_string(),
         working_dir: Some(working_dir),
@@ -341,4 +345,83 @@ async fn read_tool_prefers_end_line_over_limit() {
         "output={:?}",
         output.output
     );
+}
+
+// --- ACP client-callback delegation (Phase 3, real wiring) ---
+
+#[tokio::test]
+async fn read_tool_routes_through_acp_callback_for_an_acp_connected_session() {
+    // Proves the ACP-routed path actually returns the *callback's* content,
+    // not whatever happens to sit on the real local disk -- the strongest
+    // possible proof this is genuinely delegated, not silently falling
+    // through to a local read that happens to look similar.
+    let session_id = "acp-read-test-session";
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let members = crate::server::acp_callback::ensure_swarm_members_registered_for_test();
+    members.write().await.insert(
+        session_id.to_string(),
+        crate::server::acp_callback::test_swarm_member(session_id, event_tx),
+    );
+    let connections = crate::server::acp_callback::ensure_client_connections_registered_for_test();
+    connections.write().await.insert(
+        session_id.to_string(),
+        crate::server::acp_callback::test_acp_client_connection(session_id),
+    );
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    // A real file on disk, deliberately holding *different* content than
+    // what the simulated ACP host will answer with -- if the tool ever
+    // fell through to a local read, the output would show this instead.
+    std::fs::write(temp.path().join("watched.txt"), "stale disk content\n")
+        .expect("seed local file");
+
+    let ctx = make_ctx_with_session(session_id, temp.path().to_path_buf());
+    let input = json!({ "file_path": "watched.txt" });
+
+    let call = tokio::spawn(async move { ReadTool::new().execute(input, ctx).await });
+
+    let event = event_rx.recv().await.expect("read callback sent");
+    let crate::protocol::ServerEvent::AcpCallbackRequest { id, method, params } = event else {
+        panic!("expected AcpCallbackRequest, got {event:?}");
+    };
+    assert_eq!(method, "fs/read_text_file");
+    assert!(params["path"].as_str().unwrap().ends_with("watched.txt"));
+    crate::server::acp_callback::resolve_acp_callback(
+        id,
+        Ok(json!({"content": "live editor buffer content\n"})),
+    );
+
+    let output = call
+        .await
+        .expect("task")
+        .expect("execute should succeed");
+    assert!(
+        output.output.contains("live editor buffer content"),
+        "output={:?}",
+        output.output
+    );
+    assert!(
+        !output.output.contains("stale disk content"),
+        "must not have read the real (stale) file from disk: output={:?}",
+        output.output
+    );
+}
+
+#[tokio::test]
+async fn read_tool_still_reads_locally_for_a_non_acp_session() {
+    // The other half of "provably unaffected": a session never marked ACP
+    // must still behave exactly as before this slice.
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("plain.txt"), "ordinary disk content\n")
+        .expect("seed local file");
+
+    let output = ReadTool::new()
+        .execute(
+            json!({ "file_path": "plain.txt" }),
+            make_ctx(temp.path().to_path_buf()),
+        )
+        .await
+        .expect("execute should succeed");
+
+    assert!(output.output.contains("ordinary disk content"));
 }
