@@ -26,36 +26,53 @@ use std::sync::OnceLock;
 /// skipped.
 static USER_RULES: OnceLock<Vec<crate::execpolicy::UserRule>> = OnceLock::new();
 
+/// Gemini review, 2026-08-30: this used to be a plain `OnceLock::get_or_init`
+/// call, which caches *whatever the closure returns* -- including an empty
+/// `Vec` produced by a transient, non-malformed-policy load error (e.g. a
+/// momentary I/O hiccup on first use). Because `OnceLock` only ever
+/// initializes once, that permanently and silently disabled a perfectly
+/// valid `execpolicy.star` for the rest of the process's lifetime, with no
+/// retry. Restructured so only a *successful* load (including the normal
+/// "no policy file at all" case, which `load_user_rules` itself already
+/// treats as `Ok(vec![])`) ever populates the `OnceLock`; a real load error
+/// leaves it unset, so the next bash command retries instead of being
+/// permanently stuck. The "user needs to restart to pick up a mid-session
+/// edit" limitation (see the module docs above) is unchanged and still
+/// applies once a load has actually succeeded.
 fn user_rules() -> &'static [crate::execpolicy::UserRule] {
-    USER_RULES
-        .get_or_init(|| {
-            let Ok(path) = crate::execpolicy::default_policy_path() else {
-                return Vec::new();
-            };
-            match crate::execpolicy::load_user_rules(&path) {
-                Ok(rules) => {
-                    if !rules.is_empty() {
-                        crate::logging::info(&format!(
-                            "[execpolicy] loaded {} user rule(s) from {}",
-                            rules.len(),
-                            path.display()
-                        ));
-                    }
-                    rules
-                }
-                Err(err) => {
-                    // Fail open: a broken policy file must not block bash
-                    // entirely. Same convention as pre_tool/sandbox_macos/
-                    // mission::supervisor_gate elsewhere in this project.
-                    crate::logging::warn(&format!(
-                        "[execpolicy] failed to load {}, continuing without user rules: {err}",
-                        path.display()
-                    ));
-                    Vec::new()
-                }
+    if let Some(rules) = USER_RULES.get() {
+        return rules.as_slice();
+    }
+    let Ok(path) = crate::execpolicy::default_policy_path() else {
+        return &[];
+    };
+    match crate::execpolicy::load_user_rules(&path) {
+        Ok(rules) => {
+            if !rules.is_empty() {
+                crate::logging::info(&format!(
+                    "[execpolicy] loaded {} user rule(s) from {}",
+                    rules.len(),
+                    path.display()
+                ));
             }
-        })
-        .as_slice()
+            // set() can race with another thread also computing this on
+            // first use; whichever wins is used -- both computed the same
+            // real result from the same file, so it doesn't matter which.
+            let _ = USER_RULES.set(rules);
+            USER_RULES.get().map(Vec::as_slice).unwrap_or(&[])
+        }
+        Err(err) => {
+            // Fail open: a broken policy file must not block bash
+            // entirely. Same convention as pre_tool/sandbox_macos/
+            // mission::supervisor_gate elsewhere in this project.
+            // Deliberately NOT cached -- see doc comment above.
+            crate::logging::warn(&format!(
+                "[execpolicy] failed to load {}, continuing without user rules this time: {err}",
+                path.display()
+            ));
+            &[]
+        }
+    }
 }
 
 /// Apply the deterministic destructive-command gate, returning refusal text

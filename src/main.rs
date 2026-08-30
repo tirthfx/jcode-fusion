@@ -139,6 +139,21 @@ fn run_main() -> Result<()> {
     // Must run before the tokio runtime starts: re-exec has to happen from a
     // clean single-threaded process, not from inside an async runtime with
     // worker threads already spawned.
+    //
+    // **Deliberately runs after the three early-return multicall entry
+    // points above** (Gemini review, 2026-08-30, considered and left
+    // as-is): each of those has its own strict thread/run-loop requirement
+    // and, more importantly, none of them ever reach agent/tool code --
+    // they're thin OS-integration shims (a setup-hint callback, the macOS
+    // global-hotkey listener, the notification-broker helper) that return
+    // immediately without initializing an agent session. The sandbox's
+    // threat model is an autonomous agent doing file writes/bash calls;
+    // none of these three paths do that, so there's no real blast-radius
+    // benefit to sandboxing them, and moving the re-exec earlier would add
+    // startup latency to a UI-latency-sensitive hotkey listener and risk
+    // the Seatbelt profile interfering with legitimate system-framework
+    // calls (posting notifications, registering a global hotkey) that
+    // this project's deny list was never designed to account for.
     jcode::sandbox_macos::maybe_reexec_under_sandbox();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

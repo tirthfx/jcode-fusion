@@ -54,8 +54,16 @@ use starlark::values::list::ListRef;
 /// retrofit later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UserDecision {
-    /// Ordered so `Confirm < Deny` — see [`combine`], which takes the max.
-    /// See the enum doc comment: currently behaves the same as `Deny`.
+    /// `Confirm` sorts before `Deny` (derived `Ord`, declaration order).
+    /// **Doc correction, Gemini review 2026-08-30**: an earlier version of
+    /// this comment claimed `combine` "takes the max" of a `Confirm`/`Deny`
+    /// pair -- it never has; `combine` just passes through whichever single
+    /// rule `matching_rule` already picked (first-match-wins), it doesn't
+    /// compare or resolve multiple matches at all. Corrected here rather
+    /// than left to mislead a future implementer into assuming a rule-order-
+    /// independent conflict resolution that doesn't exist. See the enum
+    /// doc comment: `Confirm` currently behaves identically to `Deny`
+    /// regardless.
     Confirm,
     Deny,
 }
@@ -76,9 +84,31 @@ pub fn default_policy_path() -> anyhow::Result<std::path::PathBuf> {
 /// Load and evaluate a policy file, returning its `RULES` list. Returns an
 /// empty `Vec` (not an error) if the file doesn't exist -- absence just
 /// means "no user rules," the normal case.
+/// A policy file is a handful of `"prefix|decision|reason"` lines -- a few
+/// KiB at most for even a large rule set. Generous cap, real bound.
+const MAX_POLICY_FILE_BYTES: u64 = 1024 * 1024;
+
 pub fn load_user_rules(path: &std::path::Path) -> anyhow::Result<Vec<UserRule>> {
     if !path.exists() {
         return Ok(Vec::new());
+    }
+    // Gemini review, 2026-08-30: `read_to_string` had no size cap after
+    // only a `path.exists()` check (a TOCTOU-prone pattern on its own) --
+    // if `~/.jcode/execpolicy.star` is or becomes a symlink to an
+    // unbounded or special file, reading it could block or exhaust memory
+    // before the Starlark parser (which itself now has its own tick/heap
+    // limits, but only once evaluation actually starts) ever gets a chance
+    // to fail closed. Checking metadata size first doesn't fully close the
+    // TOCTOU window (the file could still change between the check and the
+    // read) but bounds the failure mode to "read up to the cap," not
+    // "block/exhaust memory on an arbitrarily large target."
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_POLICY_FILE_BYTES {
+        anyhow::bail!(
+            "execpolicy.star is {} bytes, over the {}-byte limit -- refusing to read it",
+            metadata.len(),
+            MAX_POLICY_FILE_BYTES
+        );
     }
     let content = std::fs::read_to_string(path)?;
     parse_policy_source(&content)
@@ -151,13 +181,23 @@ fn parse_rule_line(raw: &str) -> anyhow::Result<UserRule> {
     let [prefix, decision, reason] = parts.as_slice() else {
         anyhow::bail!("expected \"prefix|decision|reason\", got {raw:?}");
     };
+    let prefix = prefix.trim().to_string();
+    // Gemini review, 2026-08-30: a rule line with an empty/whitespace-only
+    // prefix segment (e.g. `" | deny | reason"`) previously parsed
+    // successfully to `prefix == ""` -- since every string starts with the
+    // empty string, `matching_rule` would then match and block literally
+    // every bash command for the rest of the process. Refuse this at parse
+    // time instead of letting it silently become a footgun.
+    if prefix.is_empty() {
+        anyhow::bail!("rule prefix must not be empty (would match every command): {raw:?}");
+    }
     let decision = match decision.trim().to_ascii_lowercase().as_str() {
         "confirm" => UserDecision::Confirm,
         "deny" => UserDecision::Deny,
         other => anyhow::bail!("unknown decision {other:?} (expected \"confirm\" or \"deny\")"),
     };
     Ok(UserRule {
-        prefix: prefix.trim().to_string(),
+        prefix,
         decision,
         reason: reason.trim().to_string(),
     })
@@ -166,11 +206,24 @@ fn parse_rule_line(raw: &str) -> anyhow::Result<UserRule> {
 /// Find the first user rule whose prefix matches `command` (case-sensitive,
 /// simple substring-of-prefix match on the trimmed command). Pure and
 /// testable independent of Starlark evaluation.
+/// Gemini review, 2026-08-30: a raw `starts_with` check on the command
+/// as-issued let irregular whitespace defeat an intended rule -- a rule
+/// prefix of `"rm "` (author intent: match `rm` followed by anything) would
+/// not match `"rm\t-rf"` or `"rm  -rf"` (a tab, or a double space), since
+/// the literal bytes right after `rm` don't equal a single space. Collapsing
+/// runs of whitespace in the command to single spaces before matching
+/// closes that specific evasion. Deliberately narrow: this does not add
+/// full tokenization or a "must match a whole word" boundary check (e.g.
+/// whether prefix `"rm"` should also match `"rmdir"`) -- that's a
+/// legitimate but separate design question about how specific a prefix
+/// rule is meant to be, not a bug, and changing it risks silently altering
+/// the meaning of existing policy files that rely on short prefixes on
+/// purpose.
 pub fn matching_rule<'a>(command: &str, rules: &'a [UserRule]) -> Option<&'a UserRule> {
-    let trimmed = command.trim();
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     rules
         .iter()
-        .find(|rule| trimmed.starts_with(rule.prefix.as_str()))
+        .find(|rule| normalized.starts_with(rule.prefix.as_str()))
 }
 
 /// A minimal stand-in for `jcode_command_risk::GateOutcome` used only for
@@ -201,6 +254,19 @@ pub fn combine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gemini review, 2026-08-30: `load_user_rules` previously had no size
+    /// cap after only a `path.exists()` check.
+    #[test]
+    fn load_user_rules_refuses_a_file_over_the_size_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("execpolicy.star");
+        let oversized = "#".repeat((MAX_POLICY_FILE_BYTES + 1) as usize);
+        std::fs::write(&path, oversized).expect("write oversized file");
+
+        let err = load_user_rules(&path).unwrap_err();
+        assert!(err.to_string().contains("limit"), "got: {err}");
+    }
 
     #[test]
     fn empty_rules_list_parses_cleanly() {
@@ -259,6 +325,18 @@ RULES = [p + "|confirm|generated" for p in prefixes]
         assert!(err.to_string().contains("unknown decision"));
     }
 
+    /// Gemini review, 2026-08-30: an empty prefix previously parsed
+    /// successfully and, since every string starts with the empty string,
+    /// would have matched -- and blocked -- every single bash command.
+    #[test]
+    fn an_empty_prefix_is_rejected_not_silently_accepted() {
+        let err = parse_policy_source(r#"RULES = [" |deny|reason"]"#).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn syntax_error_is_reported_not_panicked() {
         let result = parse_policy_source("RULES = [this is not valid starlark");
@@ -285,6 +363,27 @@ RULES = [p + "|confirm|generated" for p in prefixes]
             Some("curl")
         );
         assert_eq!(matching_rule("ls -la", &rules), None);
+    }
+
+    /// Gemini review, 2026-08-30: a rule intended to escalate "rm " (rm
+    /// followed by anything) previously failed to match irregular
+    /// whitespace between the command and its arguments.
+    #[test]
+    fn matching_rule_survives_irregular_inner_whitespace() {
+        let rules = vec![UserRule {
+            prefix: "rm ".to_string(),
+            decision: UserDecision::Deny,
+            reason: "no rm allowed".to_string(),
+        }];
+        assert!(matching_rule("rm -rf /tmp/x", &rules).is_some());
+        assert!(
+            matching_rule("rm  -rf /tmp/x", &rules).is_some(),
+            "a double space must not evade the rule"
+        );
+        assert!(
+            matching_rule("rm\t-rf /tmp/x", &rules).is_some(),
+            "a tab must not evade the rule"
+        );
     }
 
     #[test]

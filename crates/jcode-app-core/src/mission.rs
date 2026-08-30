@@ -92,6 +92,7 @@ pub fn set(session_id: &str, objective: &str) -> Result<Mission> {
     if objective.is_empty() {
         anyhow::bail!("mission objective cannot be empty");
     }
+    let _guard = lock_mission_store();
     let now = Utc::now();
     let mut mission = load(session_id)?.unwrap_or_else(|| Mission {
         session_id: session_id.to_string(),
@@ -125,6 +126,7 @@ pub fn set_success_criteria(session_id: &str, criteria: Vec<String>) -> Result<O
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .collect();
+    let _guard = lock_mission_store();
     let Some(mut mission) = load(session_id)? else {
         return Ok(None);
     };
@@ -149,6 +151,7 @@ pub fn update_status(session_id: &str, status: MissionStatus) -> Result<Option<M
              evidence and independently verified, not self-certified"
         );
     }
+    let _guard = lock_mission_store();
     let Some(mut mission) = load(session_id)? else {
         return Ok(None);
     };
@@ -204,6 +207,7 @@ pub fn claim_complete(session_id: &str, evidence: Vec<String>) -> Result<Option<
             weak.trim()
         );
     }
+    let _guard = lock_mission_store();
     let Some(mut mission) = load(session_id)? else {
         return Ok(None);
     };
@@ -245,6 +249,7 @@ pub enum VerificationOutcome {
 /// nothing yet enforces that a *different* identity must call it. Both
 /// gaps are intentional scope boundaries for this slice, not oversights.
 pub fn verify_completion(session_id: &str) -> Result<VerificationOutcome> {
+    let _guard = lock_mission_store();
     let Some(mission) = load(session_id)? else {
         return Ok(VerificationOutcome::NoPendingClaim);
     };
@@ -281,6 +286,7 @@ pub fn checkpoint(session_id: &str, summary: &str) -> Result<Option<Mission>> {
     if summary.is_empty() {
         anyhow::bail!("checkpoint summary cannot be empty");
     }
+    let _guard = lock_mission_store();
     let Some(mut mission) = load(session_id)? else {
         return Ok(None);
     };
@@ -288,6 +294,12 @@ pub fn checkpoint(session_id: &str, summary: &str) -> Result<Option<Mission>> {
         at: Utc::now(),
         summary: summary.to_string(),
     });
+    // Gemini review, 2026-08-30: cap rather than let this grow unbounded --
+    // see MAX_CHECKPOINTS's own doc comment.
+    if mission.checkpoints.len() > MAX_CHECKPOINTS {
+        let overflow = mission.checkpoints.len() - MAX_CHECKPOINTS;
+        mission.checkpoints.drain(0..overflow);
+    }
     mission.updated_at = Utc::now();
     save(&mission)?;
     Ok(Some(mission))
@@ -411,11 +423,29 @@ pub async fn supervisor_gate(session_id: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    if let Some(updated) = enforce_budget(session_id).await? {
-        if updated.status == MissionStatus::BudgetLimited {
+    // Gemini review, 2026-08-30: this used to be `enforce_budget(...).await?`
+    // -- any transient error from the budget check (a disk I/O hiccup
+    // reading/writing mission.json, not just the timeout case
+    // `enforce_budget` itself already fails open on) made the whole
+    // function return `Err` before ever reaching the completion-claim
+    // check below, even though "fail open" was meant to apply to the
+    // budget check specifically, not to skip verification entirely. A
+    // mission with a claim that would have verified successfully this
+    // turn could silently miss that, with the caller's own fail-open
+    // handling just logging a warning and running another full coordinator
+    // turn instead.
+    match enforce_budget(session_id).await {
+        Ok(Some(updated)) if updated.status == MissionStatus::BudgetLimited => {
             return Ok(Some(
                 "mission transitioned to budget_limited: a connected provider is hard-limited"
                     .to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "[mission] supervisor_gate: enforce_budget failed for session {session_id}, \
+                 continuing to check completion without a budget verdict this turn: {err}"
             ));
         }
     }
@@ -489,6 +519,32 @@ fn escape_xml_text(input: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+/// Serializes every load -> mutate -> save mutation across every mission.
+/// Gemini review, 2026-08-30: `set`/`set_success_criteria`/`update_status`/
+/// `claim_complete`/`checkpoint`/`verify_completion` each do an unguarded
+/// load-mutate-save round trip to a plain JSON file, so two concurrent
+/// invocations for the same `session_id` (parallel subagents, or the
+/// agent's own tool call racing with `supervisor_gate`'s periodic checks)
+/// could silently lose one write. Same fix, same simplicity tradeoff
+/// (process-wide, not per-`session_id`) already applied to
+/// `rewind_store.rs`'s equivalent race.
+static MISSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_mission_store() -> std::sync::MutexGuard<'static, ()> {
+    MISSION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Checkpoints are an append-only log with no natural cap of their own
+/// (Gemini review, 2026-08-30: an accidental or adversarial retry loop
+/// hammering the `checkpoint` tool action could otherwise grow
+/// `mission.json` without bound, since every load/save round-trips the
+/// whole file). Keeps the most recent entries, drops the oldest — a
+/// checkpoint log is a rolling window for context, not an audit trail that
+/// needs every entry preserved forever.
+const MAX_CHECKPOINTS: usize = 200;
 
 fn save(mission: &Mission) -> Result<()> {
     crate::storage::write_json_fast(&mission_path(&mission.session_id)?, mission)
@@ -680,6 +736,77 @@ mod completion_verification_tests {
             set(session_id, "Ship the verifier").expect("set mission");
             let outcome = verify_completion(session_id).expect("verify");
             assert_eq!(outcome, VerificationOutcome::NoPendingClaim);
+        });
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_and_concurrency_tests {
+    use super::*;
+
+    fn with_isolated_home<F: FnOnce()>(f: F) {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        f();
+        if let Some(prev_home) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev_home);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
+    }
+
+    /// Gemini review, 2026-08-30: an accumulating log with no cap could
+    /// grow `mission.json` without bound under a retry-loop-style misuse.
+    #[test]
+    fn checkpoints_beyond_the_cap_drop_the_oldest_not_the_newest() {
+        with_isolated_home(|| {
+            let session_id = "ses_checkpoint_cap";
+            set(session_id, "Cap the checkpoint log").expect("set mission");
+            for i in 0..(MAX_CHECKPOINTS + 10) {
+                checkpoint(session_id, &format!("checkpoint {i}")).expect("checkpoint");
+            }
+            let mission = load(session_id).expect("load").expect("mission exists");
+            assert_eq!(mission.checkpoints.len(), MAX_CHECKPOINTS);
+            assert_eq!(
+                mission.checkpoints.first().unwrap().summary,
+                format!("checkpoint {}", 10),
+                "the oldest surviving checkpoint should be #10 -- #0..#9 were dropped"
+            );
+            assert_eq!(
+                mission.checkpoints.last().unwrap().summary,
+                format!("checkpoint {}", MAX_CHECKPOINTS + 9),
+                "the newest checkpoint must always survive"
+            );
+        });
+    }
+
+    /// Gemini review, 2026-08-30: `checkpoint`'s load -> mutate -> save was
+    /// previously unguarded; two concurrent callers for the same session
+    /// could both load the same prior mission, each append their own
+    /// checkpoint, and save -- whichever save landed last would silently
+    /// discard the other's checkpoint. Real concurrent threads, same
+    /// pattern already proven for `rewind_store.rs`'s equivalent race.
+    #[test]
+    fn concurrent_checkpoints_for_the_same_mission_never_lose_one() {
+        with_isolated_home(|| {
+            let session_id = "ses_concurrent_checkpoint";
+            set(session_id, "Survive concurrent checkpoints").expect("set mission");
+            const WRITERS: usize = 20;
+            std::thread::scope(|scope| {
+                for i in 0..WRITERS {
+                    scope.spawn(move || {
+                        checkpoint(session_id, &format!("from thread {i}")).expect("checkpoint");
+                    });
+                }
+            });
+            let mission = load(session_id).expect("load").expect("mission exists");
+            assert_eq!(
+                mission.checkpoints.len(),
+                WRITERS,
+                "every concurrent checkpoint call must land -- none may be silently lost"
+            );
         });
     }
 }

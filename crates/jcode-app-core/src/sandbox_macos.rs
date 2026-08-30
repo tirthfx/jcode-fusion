@@ -70,6 +70,17 @@ pub fn default_protected_write_subpaths() -> Vec<&'static str> {
         ".pypirc",
         ".config/gh",
         ".azure",
+        // Gemini review, 2026-08-30: the original list covered credential
+        // stores but not shell-startup/persistence files -- a malicious
+        // agent could still achieve unsandboxed code execution on the
+        // user's next shell session or login, a materially worse outcome
+        // than "just" credential theft, which is what the module's own
+        // docs frame as the goal.
+        ".zshrc",
+        ".zprofile",
+        ".bashrc",
+        ".bash_profile",
+        "Library/LaunchAgents",
     ]
 }
 
@@ -141,10 +152,62 @@ pub fn build_seatbelt_profile(protected_write_paths: &[PathBuf]) -> String {
 /// canonicalization fails, so a genuinely unusual `$HOME` still gets
 /// *some* protection rather than none.
 pub fn resolve_default_protected_paths() -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
-    resolve_protected_paths_from(&home)
+    // Gemini review, 2026-08-30: `dirs::home_dir()` resolves via the `$HOME`
+    // environment variable -- if that's overridden (deliberately, or via an
+    // unusual launch environment) before this process starts, the generated
+    // deny rules protect the wrong directory tree while the real home
+    // directory's credentials remain writable under `(allow default)`.
+    // `system_home_dir()` looks up the OS-level home directory via
+    // `getpwuid`, independent of any environment variable -- protected
+    // *in addition to* `dirs::home_dir()`, not instead of it (either could
+    // legitimately be the one that matters; protecting both costs nothing
+    // and closes the spoofing gap without removing coverage for the
+    // ordinary "I customized $HOME on purpose" case).
+    let mut homes: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        homes.push(home);
+    }
+    if let Some(sys_home) = system_home_dir()
+        && !homes.contains(&sys_home)
+    {
+        homes.push(sys_home);
+    }
+    homes
+        .iter()
+        .flat_map(|home| resolve_protected_paths_from(home))
+        .collect()
+}
+
+/// The real, OS-level home directory for the current user, looked up via
+/// `getpwuid(getuid())` — independent of the `$HOME` environment variable.
+/// See [`resolve_default_protected_paths`] for why this matters.
+#[cfg(unix)]
+fn system_home_dir() -> Option<PathBuf> {
+    // SAFETY: `getpwuid` returns either NULL or a pointer to a `passwd`
+    // struct owned by the C library in a static/thread-local buffer valid
+    // until the next `getpwuid`/`getpwnam` call on this thread -- read
+    // immediately and copied into an owned `PathBuf`, never retained past
+    // this function, and never mutated.
+    unsafe {
+        let passwd = libc::getpwuid(libc::getuid());
+        if passwd.is_null() {
+            return None;
+        }
+        let dir_ptr = (*passwd).pw_dir;
+        if dir_ptr.is_null() {
+            return None;
+        }
+        let path_str = std::ffi::CStr::from_ptr(dir_ptr).to_str().ok()?;
+        if path_str.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(path_str))
+    }
+}
+
+#[cfg(not(unix))]
+fn system_home_dir() -> Option<PathBuf> {
+    None
 }
 
 /// The actual canonicalize-then-join logic, split out from
@@ -189,7 +252,26 @@ fn resolve_protected_paths_from(home: &std::path::Path) -> Vec<PathBuf> {
 /// caller continues running unsandboxed rather than refusing to start.
 #[cfg(target_os = "macos")]
 pub fn maybe_reexec_under_sandbox() {
-    if is_already_sandboxed() || !is_sandboxing_requested() {
+    if !is_sandboxing_requested() {
+        return;
+    }
+    if is_already_sandboxed() {
+        // Gemini review, 2026-08-30: `JCODE_FUSION_SANDBOXED` is a plain
+        // env var the initial process trusts unconditionally to mean "a
+        // real re-exec already happened" -- if it's set before this
+        // process is even launched (a wrapper script, a CI config, or a
+        // process spawned by another jcode-fusion instance), sandboxing is
+        // skipped entirely even though the user asked for it, with
+        // previously no warning logged at all. This doesn't close the
+        // spoofing gap itself (that needs real OS-level confinement
+        // verification, out of scope here) but makes the skip observable
+        // instead of fully silent.
+        crate::logging::warn(
+            "[sandbox] JCODE_FUSION_SANDBOX=1 was requested but this process already carries \
+             the internal already-sandboxed marker -- skipping re-exec. If this process was \
+             NOT itself re-exec'd by jcode-fusion under sandbox-exec, sandboxing is silently \
+             not actually active despite being requested.",
+        );
         return;
     }
 
@@ -201,29 +283,33 @@ pub fn maybe_reexec_under_sandbox() {
 }
 
 #[cfg(target_os = "macos")]
+/// Absolute path to `sandbox-exec`, a stable system binary present on every
+/// supported macOS version. Gemini review, 2026-08-30: locating it via
+/// `$PATH` instead meant a process that controls its own environment before
+/// this code runs (or a PATH modified by something earlier in the launch
+/// chain) could get a spoofed binary executed instead, or force the lookup
+/// to fail and silently fall back to the fail-open unsandboxed path.
+const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+
 fn try_reexec_under_sandbox() -> anyhow::Result<()> {
-    use std::io::Write;
-
     let profile = build_seatbelt_profile(&resolve_default_protected_paths());
-    let profile_path = std::env::temp_dir().join(format!("jcode-fusion-sandbox-{}.sb", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&profile_path)?;
-        file.write_all(profile.as_bytes())?;
-    }
-
     let current_exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new("sandbox-exec");
-    cmd.arg("-f")
-        .arg(&profile_path)
+    let mut cmd = std::process::Command::new(SANDBOX_EXEC_PATH);
+    // Gemini review, 2026-08-30: the profile used to be written to a
+    // predictable, world-readable temp-file path (`sandbox-exec -f <path>`)
+    // that followed symlinks and was never cleaned up afterward -- a
+    // TOCTOU/symlink-attack window plus a permanent leak of the sandbox
+    // layout in the shared temp directory. Passing the profile text
+    // directly via `-p` avoids the temp file entirely: no file to attack,
+    // nothing left behind.
+    cmd.arg("-p")
+        .arg(&profile)
         .arg("--")
         .arg(&current_exe)
         .args(std::env::args().skip(1))
         .env(SANDBOXED_MARKER_ENV_VAR, "1");
 
-    crate::logging::info(&format!(
-        "[sandbox] re-executing under sandbox-exec with profile {}",
-        profile_path.display()
-    ));
+    crate::logging::info("[sandbox] re-executing under sandbox-exec");
 
     // Never returns on success (process image replaced). On failure,
     // returns the io::Error so the caller can log-and-continue.
@@ -381,6 +467,58 @@ mod tests {
                 "expected {expected} in default protected list"
             );
         }
+    }
+
+    /// Gemini review, 2026-08-30: the original list covered credential
+    /// stores but not shell-startup/persistence files.
+    #[test]
+    fn default_protected_subpaths_also_cover_shell_startup_and_persistence() {
+        let subpaths = default_protected_write_subpaths();
+        for expected in [".zshrc", ".bashrc", ".bash_profile", "Library/LaunchAgents"] {
+            assert!(
+                subpaths.contains(&expected),
+                "expected {expected} in default protected list"
+            );
+        }
+    }
+
+    /// Gemini review, 2026-08-30: closes the `$HOME`-override gap by
+    /// looking up the OS-level home directory independent of any
+    /// environment variable. Real integration test against this actual
+    /// machine's password database -- read-only, safe to run anywhere.
+    #[test]
+    #[cfg(unix)]
+    fn system_home_dir_returns_a_real_existing_directory() {
+        let home = system_home_dir().expect("getpwuid should resolve a home dir for the current user");
+        assert!(home.is_dir(), "expected {home:?} to be a real, existing directory");
+    }
+
+    /// Gemini review, 2026-08-30: even when `$HOME` is spoofed to point
+    /// somewhere else, the real system home directory must still end up
+    /// protected.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_default_protected_paths_still_covers_the_system_home_even_if_home_is_spoofed() {
+        let _guard = crate::storage::lock_test_env();
+        let real_system_home = system_home_dir().expect("system home");
+        let fake_home = tempfile::tempdir().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        crate::env::set_var("HOME", fake_home.path());
+
+        let resolved = resolve_default_protected_paths();
+
+        if let Some(previous_home) = previous_home {
+            crate::env::set_var("HOME", previous_home);
+        } else {
+            crate::env::remove_var("HOME");
+        }
+
+        assert!(
+            resolved.iter().any(|p| p.starts_with(&real_system_home)),
+            "expected at least one resolved path under the real system home {real_system_home:?} \
+             even with $HOME spoofed to {:?}, got: {resolved:?}",
+            fake_home.path()
+        );
     }
 
     #[test]

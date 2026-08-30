@@ -265,10 +265,21 @@ impl WorkflowTemplate {
             );
         }
 
+        // Gemini review, 2026-08-30: iterating the `resolved` HashMap
+        // directly substituted parameters in an undefined, run-to-run-
+        // varying order -- if one parameter's *value* happened to contain
+        // another parameter's `{{name}}` placeholder syntax, whether that
+        // got double-substituted or the whole call spuriously failed with
+        // "undeclared parameter" was non-deterministic. Substituting in
+        // `self.parameters`' own declared order (a `Vec`, stable) instead
+        // makes the result reproducible for the same template + values,
+        // run to run.
         let substitute = |text: &str| -> String {
             let mut out = text.to_string();
-            for (name, value) in &resolved {
-                out = out.replace(&placeholder(name), value);
+            for param in &self.parameters {
+                if let Some(value) = resolved.get(param.name.as_str()) {
+                    out = out.replace(&placeholder(&param.name), value);
+                }
             }
             out
         };
@@ -459,6 +470,30 @@ mod tests {
         assert_eq!(specs[0].priority, 0);
         assert_eq!(specs[1].content, "Fix what the auth review found");
         assert_eq!(specs[1].depends_on, vec!["review".to_string()]);
+    }
+
+    /// Gemini review, 2026-08-30: substituting via `resolved`'s HashMap
+    /// iteration order meant the outcome could vary run to run when one
+    /// parameter's value textually contains another's `{{name}}` syntax.
+    /// Runs `instantiate` many times and requires byte-identical output
+    /// every time -- the closest a unit test can get to proving "no longer
+    /// order-dependent" without controlling HashMap iteration directly.
+    #[test]
+    fn instantiate_is_deterministic_when_a_value_contains_another_placeholder() {
+        let mut template = sample_template();
+        template.nodes[0].content = "{{subsystem}} at {{severity}}".to_string();
+        let mut values = HashMap::new();
+        values.insert("subsystem".to_string(), "see {{severity}} below".to_string());
+        values.insert("severity".to_string(), "high".to_string());
+
+        let first = template.instantiate(&values).expect("instantiate").remove(0).content;
+        for _ in 0..20 {
+            let repeat = template.instantiate(&values).expect("instantiate").remove(0).content;
+            assert_eq!(
+                repeat, first,
+                "instantiate must produce the same output every time for the same inputs"
+            );
+        }
     }
 
     #[test]

@@ -88,11 +88,32 @@ pub async fn resolve_repo_root(cwd: &Path) -> anyhow::Result<PathBuf> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
+    // Gemini review, 2026-08-30: two related fixes to how this raw output
+    // becomes a `PathBuf`.
+    // (1) `from_utf8_lossy` silently replaces any invalid UTF-8 byte with
+    //     U+FFFD -- on a filesystem that allows non-UTF-8 paths, that would
+    //     rewrite the real repo path into one that no longer exists on
+    //     disk. Built directly from the raw bytes instead (`OsStr::from_bytes`
+    //     on Unix), never decoded as UTF-8 at all.
+    // (2) `.trim()` stripped more than just git's own trailing newline -- a
+    //     real (if rare) path with meaningful leading/trailing whitespace
+    //     would have been altered. Only the exact trailing `\n` git appends
+    //     is stripped now.
+    let mut bytes = output.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.is_empty() {
         anyhow::bail!("git rev-parse --show-toplevel returned an empty path");
     }
-    Ok(PathBuf::from(path))
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
+    Ok(path)
 }
 
 /// Create a new git worktree checked out from `repo_root`'s current HEAD on
@@ -248,23 +269,37 @@ async fn list_conflicted_paths(repo_root: &Path) -> anyhow::Result<Vec<String>> 
         .arg(repo_root)
         .arg("status")
         .arg("--porcelain")
+        // Gemini review, 2026-08-30: without `-z`, git quotes and
+        // C-style-escapes (octal/backslash) any path containing spaces or
+        // non-ASCII bytes -- the old code stripped only the surrounding
+        // quote characters (`trim_matches('"')`), not the escaping within,
+        // so such a path was shown garbled rather than as its real name.
+        // `-z` emits NUL-terminated records with raw, unquoted,
+        // unescaped paths -- the standard, robust way to parse this output
+        // for tooling, not something to hand-roll a decoder for.
+        .arg("-z")
         .output()
         .await?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut files: Vec<String> = text
-        .lines()
-        .filter(|line| {
-            let status = line.get(0..2).unwrap_or("");
-            matches!(status, "UU" | "AA" | "DD" | "AU" | "UA" | "DU" | "UD")
-        })
-        .filter_map(|line| {
-            // `git status --porcelain` wraps a path containing spaces or
-            // other special characters in double quotes -- strip them so a
-            // conflict report doesn't show a filename with literal quote
-            // characters baked in. Cosmetic only: this list is for a human
-            // (or an agent) reading the tool's response text, not something
-            // re-parsed by git.
-            line.get(3..).map(|s| s.trim_matches('"').to_string())
+    // Gemini review, 2026-08-30: the exit status was never checked -- a
+    // failed invocation (e.g. a corrupted index) could yield stdout that's
+    // indistinguishable from "genuinely zero conflicts." Surface a real
+    // error instead of silently reporting a possibly-wrong empty result.
+    if !output.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut files: Vec<String> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|record| record.len() > 3)
+        .filter_map(|record| {
+            let status = std::str::from_utf8(&record[0..2]).ok()?;
+            if !matches!(status, "UU" | "AA" | "DD" | "AU" | "UA" | "DU" | "UD") {
+                return None;
+            }
+            String::from_utf8(record[3..].to_vec()).ok()
         })
         .collect();
     files.sort();
@@ -406,7 +441,24 @@ pub async fn merge_worktree_branch(
         .await
         .unwrap_or_else(|| repo_root.join(".git").join("MERGE_HEAD"));
     let merge_was_in_progress = tokio::fs::try_exists(&merge_head).await.unwrap_or(false);
-    let files = list_conflicted_paths(repo_root).await.unwrap_or_default();
+    let files = match list_conflicted_paths(repo_root).await {
+        Ok(files) => files,
+        Err(err) => {
+            // Gemini review, 2026-08-30: don't conflate "git status itself
+            // failed" with "genuinely zero conflicts" -- log the real
+            // reason distinctly. Still falls through to an empty list
+            // below (the existing `files.is_empty()` branch already
+            // refuses to report a false `Conflict{files: []}` and instead
+            // surfaces the merge's own stderr), so this doesn't change
+            // the outcome, only the diagnostic trail.
+            crate::logging::warn(&format!(
+                "[swarm-worktree] could not determine conflicted files for merge of '{branch}' \
+                 in {}: {err}",
+                repo_root.display()
+            ));
+            Vec::new()
+        }
+    };
 
     if merge_was_in_progress {
         let abort = tokio::process::Command::new("git")
@@ -893,6 +945,49 @@ mod tests {
         assert!(!repo.path().join(".git").join("MERGE_HEAD").exists());
         let uncommitted = std::fs::read_to_string(repo.path().join("README.md")).expect("read");
         assert_eq!(uncommitted, "coordinator's uncommitted edit\n");
+    }
+
+    /// Gemini review, 2026-08-30: without `-z`, git quotes and C-style-
+    /// escapes a conflicting path containing special characters -- a plain
+    /// `trim_matches('"')` stripped only the surrounding quotes, leaving a
+    /// literal backslash-quote embedded rather than the real filename.
+    #[tokio::test]
+    async fn conflict_file_names_with_special_characters_are_reported_verbatim() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+        let repo = init_test_repo().await;
+        let filename = "weird file\"name.md";
+
+        std::fs::write(repo.path().join(filename), "a\n").expect("write file");
+        git_ok(repo.path(), &["add", "."]);
+        git_ok(repo.path(), &["commit", "-q", "-m", "add weird file"]);
+
+        let worktree_path = create_worktree(repo.path(), "worker-weird-name")
+            .await
+            .expect("create");
+
+        std::fs::write(repo.path().join(filename), "coordinator\n").expect("write coordinator");
+        git_ok(repo.path(), &["add", "."]);
+        git_ok(repo.path(), &["commit", "-q", "-m", "coordinator edit"]);
+
+        std::fs::write(worktree_path.join(filename), "worker\n").expect("write worker");
+        git_ok(&worktree_path, &["add", "."]);
+        git_ok(&worktree_path, &["commit", "-q", "-m", "worker edit"]);
+
+        let outcome = merge_worktree_branch(repo.path(), &worktree_path)
+            .await
+            .expect("merge call itself should not error on a conflict");
+        let files = match outcome {
+            MergeOutcome::Conflict { files } => files,
+            other => panic!("expected Conflict, got {other:?}"),
+        };
+        assert_eq!(
+            files,
+            vec![filename.to_string()],
+            "the real filename (including its embedded quote) must be reported verbatim, \
+             not garbled by leftover git quoting/escaping"
+        );
     }
 
     #[tokio::test]

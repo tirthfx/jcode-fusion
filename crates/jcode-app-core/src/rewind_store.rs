@@ -35,6 +35,20 @@ pub struct RewindSnapshot {
     /// snapshot is ever restored. Not a security boundary — a corruption/
     /// integrity check, so a truncated write or manual file edit is refused
     /// rather than silently applied as if it were a trustworthy prior state.
+    ///
+    /// **Explicitly not defense against deliberate tampering** (Gemini
+    /// review, 2026-08-30, sharpening this doc comment rather than the
+    /// mechanism itself): this is a plain, unkeyed hash — anything with
+    /// filesystem write access to `~/.jcode/rewind/` can edit the stored
+    /// messages and simply recompute a matching hash. A real
+    /// tamper-resistant check needs an HMAC with a locally-held secret,
+    /// which needs its own key-management story (an OS keychain, most
+    /// plausibly) — a genuinely bigger feature, not a drop-in change to
+    /// this struct. "Provable-safe" in this module's own docs has always
+    /// meant "provably not corrupted," never "provably not tampered with by
+    /// something that already has local filesystem access" — recorded
+    /// explicitly here so that distinction isn't assumed away by a future
+    /// reader.
     pub content_hash: String,
 }
 
@@ -57,11 +71,19 @@ pub enum PopOutcome {
     Popped(Box<RewindSnapshot>),
 }
 
+/// Gemini review, 2026-08-30: `created_at` was previously omitted from the
+/// hash payload entirely (it wasn't even known yet at the point `push_snapshot`
+/// used to call this — `created_at: Utc::now()` was set *after* the hash was
+/// computed), so that field could be altered on disk without the integrity
+/// check ever noticing. Now a required input, computed once by the caller
+/// and used for both the hash and the stored field, so they can never
+/// diverge.
 fn compute_hash(
     messages: &[StoredMessage],
     provider_session_id: &Option<String>,
     session_provider_session_id: &Option<String>,
     visible_message_count: usize,
+    created_at: DateTime<Utc>,
 ) -> Result<String> {
     #[derive(Serialize)]
     struct HashPayload<'a> {
@@ -69,12 +91,14 @@ fn compute_hash(
         provider_session_id: &'a Option<String>,
         session_provider_session_id: &'a Option<String>,
         visible_message_count: usize,
+        created_at: DateTime<Utc>,
     }
     let bytes = serde_json::to_vec(&HashPayload {
         messages,
         provider_session_id,
         session_provider_session_id,
         visible_message_count,
+        created_at,
     })?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -114,11 +138,13 @@ pub fn push_snapshot(
     session_provider_session_id: Option<String>,
     visible_message_count: usize,
 ) -> Result<usize> {
+    let created_at = Utc::now();
     let content_hash = compute_hash(
         &messages,
         &provider_session_id,
         &session_provider_session_id,
         visible_message_count,
+        created_at,
     )?;
     let _guard = lock_rewind_store();
     let mut stack = load_stack(session_id)?;
@@ -127,7 +153,7 @@ pub fn push_snapshot(
         provider_session_id,
         session_provider_session_id,
         visible_message_count,
-        created_at: Utc::now(),
+        created_at,
         content_hash,
     });
     let depth = stack.snapshots.len();
@@ -150,6 +176,7 @@ pub fn pop_snapshot(session_id: &str) -> Result<PopOutcome> {
         &snapshot.provider_session_id,
         &snapshot.session_provider_session_id,
         snapshot.visible_message_count,
+        snapshot.created_at,
     )?;
     if expected_hash != snapshot.content_hash {
         // Refuse rather than guess: do NOT save `stack` (which has this
@@ -178,7 +205,17 @@ pub fn clear(session_id: &str) -> Result<()> {
     let _guard = lock_rewind_store();
     let path = stack_path(session_id)?;
     if path.exists() {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(&path)?;
+    }
+    // Gemini review, 2026-08-30: `write_json_fast` (jcode-storage, upstream)
+    // preserves the previous version as a `.bak` hard link on every write
+    // (`path.with_extension("bak")`) -- `clear` removed only the primary
+    // file, leaving a full copy of the "discarded" conversation history
+    // readable on disk. Best-effort: a `.bak` that never existed, or that's
+    // already gone, is not an error.
+    let bak_path = path.with_extension("bak");
+    if bak_path.exists() {
+        std::fs::remove_file(&bak_path)?;
     }
     Ok(())
 }
@@ -322,6 +359,31 @@ mod tests {
                 1,
                 "a refused/corrupt snapshot must not be silently dropped from the stack"
             );
+        });
+    }
+
+    /// Gemini review, 2026-08-30: `created_at` used to be excluded from the
+    /// hash payload -- altering it on disk previously passed the integrity
+    /// check silently.
+    #[test]
+    fn tampering_with_created_at_alone_is_also_caught() {
+        with_isolated_home(|| {
+            let session_id = "ses_tampered_timestamp";
+            push_snapshot(session_id, vec![msg("original")], None, None, 1).expect("push");
+
+            let path = stack_path(session_id).expect("path");
+            let mut stack: RewindStack = crate::storage::read_json(&path).expect("read");
+            stack.snapshots[0].created_at =
+                stack.snapshots[0].created_at + chrono::Duration::days(365);
+            crate::storage::write_json_fast(&path, &stack).expect("write tampered");
+
+            match pop_snapshot(session_id).expect("pop") {
+                PopOutcome::Corrupt { .. } => {}
+                other => panic!(
+                    "expected Corrupt after tampering with created_at alone, got {:?}",
+                    other
+                ),
+            }
         });
     }
 

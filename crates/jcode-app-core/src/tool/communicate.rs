@@ -21,7 +21,10 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-const REQUEST_ID: u64 = 1;
+// `pub(crate)`, not private: `tool/workflow.rs` reuses this same constant
+// for the identical reason (a fresh socket per request, no multiplexing, so
+// the id is always meaningfully "1" — see its own comment where it's used).
+pub(crate) const REQUEST_ID: u64 = 1;
 
 /// Default number of workers `run_plan` keeps active at once for a **light**-mode
 /// plan. Light mode is the cheap fan-out preset, so this stays small. Deep mode

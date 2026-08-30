@@ -202,7 +202,12 @@ impl Tool for WorkflowTool {
                         node_specs.iter().map(|spec| spec.id.clone()).collect();
 
                     let request = Request::CommSeedGraph {
-                        id: 1,
+                        // Gemini review, 2026-08-30: was a bare `1` --
+                        // harmless (a fresh socket per request, no
+                        // multiplexing, same as every call site in
+                        // communicate.rs) but an inconsistency worth
+                        // cleaning up in favor of the shared constant.
+                        id: crate::tool::communicate::REQUEST_ID,
                         session_id: ctx.session_id.clone(),
                         mode: params.mode.clone(),
                         nodes: node_specs,
