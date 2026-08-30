@@ -1,5 +1,4 @@
-//! Fusion Phase 3: orchestration-as-script, first slice (DESIGN.md §6 item
-//! #8).
+//! Fusion Phase 3: orchestration-as-script (DESIGN.md §6 item #8).
 //!
 //! **Scoping note, source-verified before writing any of this**: the
 //! original size estimate assumed a new `rhai` dependency for this. That's
@@ -12,19 +11,30 @@
 //! with ~27 call sites across nearly every plan mutation -- orchestration-
 //! as-script doesn't need to build persistence from scratch, it needs a new
 //! capability on top: turning a plan into a reusable, parameterized,
-//! replayable **template**. That's what this slice builds. A follow-up
+//! replayable **template**. That's what this module builds. A follow-up
 //! slice can layer Starlark on top for real conditional/loop logic inside a
 //! template, the same "extend, don't replace" pattern execpolicy used for
 //! `jcode-command-risk` -- not needed for a template that's just
 //! parameterized text substitution.
 //!
-//! **Deliberately out of scope for this slice** (documented, not silently
-//! skipped): no agent tool wiring yet (no `workflow` tool action to save/run
-//! a template from a live session -- this slice is types + persistence +
-//! instantiation logic only, the same "smallest coherent first slice" shape
-//! Phase 0's Mission Engine work started with). No Starlark scripting inside
-//! a template (see above). No template versioning/migration if the shape
-//! changes later. No listing/discovery UI.
+//! **Real correction made mid-implementation, not shipped wrong on
+//! purpose**: the first version of this module modeled a template node on
+//! `PlanItem` (id/content/priority-as-string/subsystem/file_scope/
+//! blocked_by). Reading `tool/communicate.rs`'s existing `task_graph`/
+//! `seed_graph` action (the real integration point a template's output
+//! needs to feed into, via `Request::CommSeedGraph`) found that action
+//! actually takes `TaskGraphNodeSpec { id, content, kind, depends_on,
+//! priority: u8 }` -- a different, narrower shape than `PlanItem`.
+//! `subsystem`/`file_scope` are explicitly fields "the engine does not own"
+//! (see `jcode_plan::bridge::apply_task_graph`'s own doc comment) at this
+//! integration point, and `kind` (explore/implement/verify/fix/synthesize/
+//! critique) has no `PlanItem` equivalent at all. Retargeted `TemplateNode`
+//! to match `TaskGraphNodeSpec` before any tool wiring was built on the
+//! wrong shape, rather than carrying the mismatch forward.
+//!
+//! **Deliberately out of scope still**: no Starlark scripting inside a
+//! template (see above). No template versioning/migration if the shape
+//! changes later.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,10 +42,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::plan::PlanItem;
+use crate::protocol::TaskGraphNodeSpec;
 
 /// A declared parameter a template's nodes can reference via `{{name}}`
-/// placeholders in `content`/`subsystem`/`file_scope`.
+/// placeholders in `content`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowParameter {
     pub name: String,
@@ -47,30 +57,32 @@ pub struct WorkflowParameter {
     pub default: Option<String>,
 }
 
-/// One task node in a template, pre-substitution. Mirrors the subset of
-/// [`PlanItem`] a template actually needs to declare -- `status` and
-/// `assigned_to` are deliberately not template fields, since every
-/// instantiation always starts a node at `"pending"`/unassigned regardless
-/// of what a prior run of the same template ended up with.
+/// One task node in a template, pre-substitution. Matches
+/// [`TaskGraphNodeSpec`] field-for-field (the type `tool_run` below actually
+/// hands to `Request::CommSeedGraph`), plus `content`'s placeholder support.
+/// `kind` mirrors `jcode_plan::bridge::parse_kind`'s own vocabulary
+/// (explore/implement/verify/fix/synthesize/critique, default explore) --
+/// deliberately a plain `Option<String>` here rather than re-declaring that
+/// enum, so this module doesn't need to track it if it ever changes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TemplateNode {
     pub id: String,
     pub content: String,
-    #[serde(default = "default_priority")]
-    pub priority: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subsystem: Option<String>,
+    pub kind: Option<String>,
+    /// 0 = high, 2 = low, anything else (including the default, 1) = medium
+    /// -- matches `jcode_plan::bridge::priority_string`'s exact mapping.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub file_scope: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blocked_by: Vec<String>,
+    pub depends_on: Vec<String>,
 }
 
-fn default_priority() -> String {
-    "medium".to_string()
+fn default_priority() -> u8 {
+    1
 }
 
-/// A saved, reusable, parameterized swarm plan. Persisted at
+/// A saved, reusable, parameterized swarm task graph. Persisted at
 /// `~/.jcode/workflows/<name>.json` via [`save`]/[`load`] -- atomic writes
 /// with corruption recovery come for free from `jcode_storage`'s existing
 /// `write_json_fast`/`read_json`, the same primitives `rewind_store.rs`
@@ -96,7 +108,7 @@ fn placeholder(name: &str) -> String {
 impl WorkflowTemplate {
     /// Validate structural invariants that are cheap to check up front and
     /// would otherwise surface as a confusing failure much later (a
-    /// dangling `blocked_by` reference breaking swarm plan construction, a
+    /// dangling `depends_on` reference breaking swarm plan construction, a
     /// duplicate node id silently shadowing one node with another).
     /// Called by both [`save`] (refuse to persist something already known
     /// to be broken) and [`instantiate`] (refuse to hand back a plan built
@@ -105,6 +117,23 @@ impl WorkflowTemplate {
     pub fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             anyhow::bail!("workflow template name must not be empty");
+        }
+        // The name isn't just a filename component (already handled by
+        // `sanitize_name` at the storage layer) -- it's also echoed back
+        // verbatim in `list()`'s output text, which an agent reads as
+        // normal tool output. A name containing a newline could inject a
+        // fake extra list entry; ANSI escapes could spoof terminal UI.
+        // Restrict to the same safe charset `sanitize_name` already uses,
+        // so a validated template's name is never in need of sanitizing.
+        if !self
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!(
+                "workflow template name '{}' must contain only letters, digits, '-', or '_'",
+                self.name
+            );
         }
         if self.nodes.is_empty() {
             anyhow::bail!("workflow template '{}' has no nodes", self.name);
@@ -129,10 +158,10 @@ impl WorkflowTemplate {
         let known_ids: std::collections::HashSet<&str> =
             self.nodes.iter().map(|n| n.id.as_str()).collect();
         for node in &self.nodes {
-            for dep in &node.blocked_by {
+            for dep in &node.depends_on {
                 if !known_ids.contains(dep.as_str()) {
                     anyhow::bail!(
-                        "workflow template '{}': node '{}' is blocked_by unknown node '{}'",
+                        "workflow template '{}': node '{}' depends_on unknown node '{}'",
                         self.name,
                         node.id,
                         dep
@@ -161,8 +190,8 @@ impl WorkflowTemplate {
     }
 
     /// Substitute every declared parameter's `{{name}}` placeholder across
-    /// all nodes and produce a real `Vec<PlanItem>`, ready to hand to
-    /// whatever already builds a `VersionedPlan` from plan items.
+    /// all nodes and produce real `TaskGraphNodeSpec`s, ready to hand
+    /// straight to `Request::CommSeedGraph`.
     ///
     /// Refuses (does not silently proceed) on:
     /// - a required parameter (no `default`) with no value supplied,
@@ -170,7 +199,7 @@ impl WorkflowTemplate {
     ///   this means the template referenced a parameter it never declared,
     ///   which is a template authoring bug, not something to paper over by
     ///   leaving the literal placeholder text in a real task's content.
-    pub fn instantiate(&self, values: &HashMap<String, String>) -> Result<Vec<PlanItem>> {
+    pub fn instantiate(&self, values: &HashMap<String, String>) -> Result<Vec<TaskGraphNodeSpec>> {
         self.validate()?;
 
         let mut missing = Vec::new();
@@ -204,41 +233,28 @@ impl WorkflowTemplate {
             out
         };
 
-        let mut items = Vec::with_capacity(self.nodes.len());
+        let mut specs = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let content = substitute(&node.content);
-            let subsystem = node.subsystem.as_deref().map(substitute);
-            let file_scope: Vec<String> = node.file_scope.iter().map(|f| substitute(f)).collect();
-
-            for (label, text) in [("content", content.as_str())]
-                .into_iter()
-                .chain(subsystem.as_deref().map(|s| ("subsystem", s)))
-                .chain(file_scope.iter().map(|f| ("file_scope entry", f.as_str())))
-            {
-                if let Some(leftover) = find_unresolved_placeholder(text) {
-                    anyhow::bail!(
-                        "workflow template '{}': node '{}' {} references \
-                         undeclared parameter '{}'",
-                        self.name,
-                        node.id,
-                        label,
-                        leftover
-                    );
-                }
+            if let Some(leftover) = find_unresolved_placeholder(&content) {
+                anyhow::bail!(
+                    "workflow template '{}': node '{}' content references \
+                     undeclared parameter '{}'",
+                    self.name,
+                    node.id,
+                    leftover
+                );
             }
 
-            items.push(PlanItem {
-                content,
-                status: "pending".to_string(),
-                priority: node.priority.clone(),
+            specs.push(TaskGraphNodeSpec {
                 id: node.id.clone(),
-                subsystem,
-                file_scope,
-                blocked_by: node.blocked_by.clone(),
-                assigned_to: None,
+                content,
+                kind: node.kind.clone(),
+                depends_on: node.depends_on.clone(),
+                priority: node.priority,
             });
         }
-        Ok(items)
+        Ok(specs)
     }
 }
 
@@ -294,6 +310,33 @@ pub fn load(name: &str) -> Result<WorkflowTemplate> {
     crate::storage::read_json(&path)
 }
 
+/// List the names of every saved template, sorted. Reads the template's own
+/// `name` field out of each file rather than trusting the sanitized
+/// filename to round-trip back to the original name (it doesn't always --
+/// `sanitize_name` is lossy for names containing characters outside
+/// `[A-Za-z0-9_-]`).
+pub fn list() -> Result<Vec<String>> {
+    let dir = workflows_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("reading workflows dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(template) = crate::storage::read_json::<WorkflowTemplate>(&path) {
+            names.push(template.name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,18 +361,16 @@ mod tests {
                 TemplateNode {
                     id: "review".to_string(),
                     content: "Review {{subsystem}} for {{severity}}+ issues".to_string(),
-                    priority: "high".to_string(),
-                    subsystem: Some("{{subsystem}}".to_string()),
-                    file_scope: vec!["{{subsystem}}/**".to_string()],
-                    blocked_by: vec![],
+                    kind: Some("critique".to_string()),
+                    priority: 0,
+                    depends_on: vec![],
                 },
                 TemplateNode {
                     id: "fix".to_string(),
                     content: "Fix what the {{subsystem}} review found".to_string(),
-                    priority: "medium".to_string(),
-                    subsystem: Some("{{subsystem}}".to_string()),
-                    file_scope: vec![],
-                    blocked_by: vec!["review".to_string()],
+                    kind: Some("fix".to_string()),
+                    priority: 1,
+                    depends_on: vec!["review".to_string()],
                 },
             ],
         }
@@ -342,16 +383,13 @@ mod tests {
         values.insert("subsystem".to_string(), "auth".to_string());
         // severity deliberately omitted -- must fall back to its default.
 
-        let items = template.instantiate(&values).expect("instantiate");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].content, "Review auth for medium+ issues");
-        assert_eq!(items[0].subsystem.as_deref(), Some("auth"));
-        assert_eq!(items[0].file_scope, vec!["auth/**".to_string()]);
-        assert_eq!(items[1].content, "Fix what the auth review found");
-        assert_eq!(items[1].blocked_by, vec!["review".to_string()]);
-        // Every instantiation starts fresh, regardless of any prior run.
-        assert!(items.iter().all(|i| i.status == "pending"));
-        assert!(items.iter().all(|i| i.assigned_to.is_none()));
+        let specs = template.instantiate(&values).expect("instantiate");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].content, "Review auth for medium+ issues");
+        assert_eq!(specs[0].kind.as_deref(), Some("critique"));
+        assert_eq!(specs[0].priority, 0);
+        assert_eq!(specs[1].content, "Fix what the auth review found");
+        assert_eq!(specs[1].depends_on, vec!["review".to_string()]);
     }
 
     #[test]
@@ -375,9 +413,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_dangling_blocked_by_reference() {
+    fn validate_rejects_a_dangling_depends_on_reference() {
         let mut template = sample_template();
-        template.nodes[1].blocked_by = vec!["does-not-exist".to_string()];
+        template.nodes[1].depends_on = vec!["does-not-exist".to_string()];
         let err = template.validate().unwrap_err().to_string();
         assert!(err.contains("does-not-exist"), "got: {err}");
     }
@@ -407,6 +445,19 @@ mod tests {
         let mut template = sample_template();
         template.nodes.clear();
         assert!(template.validate().is_err());
+    }
+
+    /// Regression test for a real finding from an external review: `name`
+    /// is echoed verbatim in `list()`'s tool-output text, so a newline or
+    /// ANSI escape sequence in it could inject a fake list entry or spoof
+    /// terminal output for whoever reads that response (a human, or an
+    /// agent treating it as normal tool text).
+    #[test]
+    fn validate_rejects_a_name_with_unsafe_characters() {
+        let mut template = sample_template();
+        template.name = "legit\n- fake-injected-entry".to_string();
+        let err = template.validate().unwrap_err().to_string();
+        assert!(err.contains("letters, digits"), "got: {err}");
     }
 
     #[tokio::test]
@@ -445,6 +496,27 @@ mod tests {
         crate::env::set_var("JCODE_HOME", jcode_home.path());
 
         assert!(load("never-saved").is_err());
+    }
+
+    #[tokio::test]
+    async fn list_returns_saved_names_sorted() {
+        let _guard = crate::storage::lock_test_env();
+        let jcode_home = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", jcode_home.path());
+
+        assert_eq!(list().expect("list empty"), Vec::<String>::new());
+
+        let mut b = sample_template();
+        b.name = "zzz-last".to_string();
+        save(&b).expect("save b");
+        let mut a = sample_template();
+        a.name = "aaa-first".to_string();
+        save(&a).expect("save a");
+
+        assert_eq!(
+            list().expect("list"),
+            vec!["aaa-first".to_string(), "zzz-last".to_string()]
+        );
     }
 
     #[test]

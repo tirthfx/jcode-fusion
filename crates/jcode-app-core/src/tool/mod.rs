@@ -37,6 +37,7 @@ mod skill;
 mod todo;
 mod webfetch;
 mod websearch;
+mod workflow;
 mod write;
 
 use crate::compaction::CompactionManager;
@@ -303,6 +304,7 @@ impl Registry {
                 goal::InitiativeTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "mission", mission::MissionTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "workflow", workflow::WorkflowTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "gmail", gmail::GmailTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "schedule", ambient::ScheduleTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "selfdev", selfdev::SelfDevTool::new);

@@ -42,11 +42,17 @@ fn request_type_from_json(json: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-pub(super) async fn send_request(request: Request) -> Result<ServerEvent> {
+/// Send a `Request` to the daemon over the swarm socket and await its
+/// matching `ServerEvent` response. Deliberately `pub(crate)`, not
+/// comm-specific despite living under `tool/communicate/` -- this is a
+/// generic "one request, one response" transport helper other tools (e.g.
+/// `tool/workflow.rs`) reuse rather than re-implementing the same socket
+/// connect/write/read-matching-response logic.
+pub(crate) async fn send_request(request: Request) -> Result<ServerEvent> {
     send_request_with_timeout(request, None).await
 }
 
-pub(super) async fn send_request_with_timeout(
+pub(crate) async fn send_request_with_timeout(
     request: Request,
     timeout: Option<std::time::Duration>,
 ) -> Result<ServerEvent> {

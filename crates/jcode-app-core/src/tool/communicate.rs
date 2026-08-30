@@ -29,7 +29,7 @@ const REQUEST_ID: u64 = 1;
 /// with the server's recursive-spawn RAM safety guard).
 const LIGHT_MODE_DEFAULT_CONCURRENCY: usize = 4;
 
-mod transport;
+pub(crate) mod transport;
 use transport::{send_request, send_request_with_timeout};
 
 fn fresh_spawn_request_nonce(ctx: &ToolContext) -> String {

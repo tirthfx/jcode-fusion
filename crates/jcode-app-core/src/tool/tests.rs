@@ -1611,8 +1611,15 @@ fn the_dialect_sweep_catches_the_issue_754_schema() {
 #[tokio::test]
 async fn only_the_known_open_world_tools_are_ineligible_for_openai_strict_mode() {
     /// Built-ins that legitimately cannot be strict. Verified against master
-    /// before the #711/#713 eligibility changes, so this is pre-existing.
-    const KNOWN_OPEN_WORLD_TOOLS: &[&str] = &["batch", "browser", "initiative", "swarm"];
+    /// before the #711/#713 eligibility changes, so most of this is
+    /// pre-existing. `workflow` (Fusion, Phase 3) is a deliberate addition,
+    /// not a regression: its `run` action's `values` parameter is a
+    /// genuinely open key-value map (parameter names come from whatever
+    /// template is being run, unknowable at schema-definition time) --
+    /// same category of open-world payload as `batch`'s own
+    /// `additionalProperties: true`, not a schema authoring mistake.
+    const KNOWN_OPEN_WORLD_TOOLS: &[&str] =
+        &["batch", "browser", "initiative", "swarm", "workflow"];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
