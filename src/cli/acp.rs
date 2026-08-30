@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -265,7 +266,7 @@ impl DaemonSession {
 /// daemon -- see `DaemonSession` for that direction), still awaiting a
 /// response. `Ok`/`Err` mirror the JSON-RPC `result`/`error` fields the
 /// eventual response line will carry.
-type PendingClientRequests = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<std::result::Result<Value, Value>>>>>;
+type PendingClientRequests = Arc<StdMutex<HashMap<u64, tokio::sync::oneshot::Sender<std::result::Result<Value, Value>>>>>;
 
 /// Removes `id` from `pending` when dropped, however `send_client_request`'s
 /// scope ends -- normal completion, an early `?`-return, or the caller
@@ -275,13 +276,24 @@ type PendingClientRequests = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender
 /// response routing (the two other cleanup paths) ever get to run for a
 /// future that was simply dropped mid-await.
 ///
-/// Uses `try_lock` (synchronous -- `Drop::drop` can't be `async`) on
-/// `tokio::sync::Mutex`, which supports it directly. Best-effort: if the
-/// lock is contested at the exact moment of drop (another task is
-/// concurrently completing this same id via `handle_message`, which is
-/// itself harmless -- that path already removes the entry), this simply
-/// does nothing rather than blocking a destructor, which is the correct
-/// tradeoff since the entry is either already gone or about to be.
+/// **A real, high-severity follow-up bug caught by a later, final full-repo
+/// review**: the first version of this fix backed `PendingClientRequests`
+/// with `tokio::sync::Mutex` and used `try_lock()` here (`Drop::drop` can't
+/// be `async`, so a blocking `.lock()` on an async mutex wasn't an option).
+/// That `try_lock()` fails whenever the lock is *contested by anything*, not
+/// just by another task completing this exact id -- an unrelated
+/// `send_client_request` call inserting a *different* id, or
+/// `handle_message` processing a *different* response, holds the same
+/// single map-wide lock too. If this guard's drop lands in that window, the
+/// cleanup is silently skipped and the entry leaks forever (unbounded, if
+/// slow, growth of this map over a long-lived daemon connection). Fixed by
+/// switching to a plain `std::sync::Mutex` -- the lock is only ever held for
+/// a brief, synchronous `HashMap` operation, never across an `.await`
+/// (verified: every call site is `{ lock(); insert/remove(); }` in its own
+/// block, nothing more), so a real, always-succeeding `.lock()` is both safe
+/// and correct here, exactly the pattern this crate's own
+/// `server/acp_callback.rs::PendingAcpCallbacks` already uses for the
+/// identical reason.
 struct PendingRequestGuard {
     pending: PendingClientRequests,
     id: u64,
@@ -289,9 +301,10 @@ struct PendingRequestGuard {
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.try_lock() {
-            pending.remove(&self.id);
-        }
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 
@@ -327,7 +340,7 @@ impl AcpRuntime {
             provider_choice,
             model,
             provider_profile,
-            pending_client_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_client_requests: Arc::new(StdMutex::new(HashMap::new())),
             next_client_request_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -378,7 +391,11 @@ impl AcpRuntime {
         // below, regardless of whether routing actually found a match.
         if message.is_response() {
             if let Some((id, payload)) = route_response(message) {
-                let waiter = self.pending_client_requests.lock().await.remove(&id);
+                let waiter = self
+                    .pending_client_requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(payload);
                 }
@@ -1446,7 +1463,10 @@ impl AcpRuntime {
         let id = self.next_client_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut pending = self.pending_client_requests.lock().await;
+            let mut pending = self
+                .pending_client_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.insert(id, tx);
         }
         // Gemini review, 2026-08-30: without this, a caller that drops this
@@ -2686,7 +2706,7 @@ mod tests {
     async fn handle_message_routes_a_response_to_the_pending_waiter() {
         let runtime = test_runtime();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        runtime.pending_client_requests.lock().await.insert(42, tx);
+        runtime.pending_client_requests.lock().unwrap().insert(42, tx);
 
         let response =
             JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":42,"result":{"ok":true}}"#)
@@ -2696,7 +2716,7 @@ mod tests {
         let payload = rx.await.expect("waiter should have been completed");
         assert_eq!(payload, Ok(json!({"ok": true})));
         assert!(
-            !runtime.pending_client_requests.lock().await.contains_key(&42),
+            !runtime.pending_client_requests.lock().unwrap().contains_key(&42),
             "the pending entry must be removed once routed"
         );
     }
@@ -2753,7 +2773,7 @@ mod tests {
             .await;
         assert!(result.is_err(), "must time out, not hang forever");
         assert!(
-            runtime.pending_client_requests.lock().await.is_empty(),
+            runtime.pending_client_requests.lock().unwrap().is_empty(),
             "a timed-out request must clean up its own pending-map entry"
         );
     }
@@ -2776,7 +2796,7 @@ mod tests {
         // deterministic (bounded retries on a real condition), not a fixed
         // sleep guessing how long registration takes.
         let id = loop {
-            let pending = runtime.pending_client_requests.lock().await;
+            let pending = runtime.pending_client_requests.lock().unwrap();
             if let Some((&id, _)) = pending.iter().next() {
                 break id;
             }
@@ -2792,5 +2812,48 @@ mod tests {
 
         let result = send_task.await.expect("task").expect("should resolve");
         assert_eq!(result, json!({"content": "file contents"}));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancellations_never_leak_pending_entries_under_lock_contention() {
+        // Regression for a real, high-severity bug a final full-repo review
+        // caught: the original fix for the "cancelled request leaks its
+        // entry" bug (see `PendingRequestGuard`'s own doc comment) used a
+        // `tokio::sync::Mutex` guarded by `try_lock()` in `Drop::drop` (a
+        // blocking `.lock()` isn't available in a non-async destructor).
+        // `try_lock()` fails whenever the lock is contested by *anything*
+        // -- an unrelated concurrent insert or remove for a *different* id
+        // holds the exact same map-wide lock too, not just another task
+        // completing this specific one. A guard dropped at that instant
+        // silently skipped its own cleanup, leaking the entry forever.
+        //
+        // This drives real concurrent traffic -- many tasks racing on the
+        // *same* mutex, each inserting then (via a near-instant timeout)
+        // cancelling -- and asserts the map is provably empty afterward.
+        // The old `try_lock`-based version had a real, if timing-dependent,
+        // chance of failing this exact assertion; `std::sync::Mutex`'s
+        // always-succeeds `.lock()` (this crate's own fix) cannot.
+        let runtime = test_runtime();
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let runtime = runtime.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = runtime
+                    .send_client_request(
+                        "fs/read_text_file",
+                        json!({"path": "/tmp/x"}),
+                        std::time::Duration::from_millis(1),
+                    )
+                    .await;
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task");
+        }
+
+        assert!(
+            runtime.pending_client_requests.lock().unwrap().is_empty(),
+            "every request must clean up its own pending-map entry, even under heavy concurrent lock contention"
+        );
     }
 }

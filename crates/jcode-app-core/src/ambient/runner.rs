@@ -853,7 +853,28 @@ impl AmbientRunnerHandle {
                         // its own separate variable from
                         // `JCODE_FUSION_MEMORY_CONSOLIDATION` -- the two
                         // halves of item #9 are independently toggleable).
-                        if let Err(e) = crate::memory_consolidator::run_memory_md_consolidation() {
+                        //
+                        // A final full-repo review flagged this as a real
+                        // (if likely low-impact for a typical, curated-size
+                        // memory store) Tokio anti-pattern: `run_memory_md_
+                        // consolidation` is entirely synchronous -- it loads
+                        // and sorts the full memory set and does real file
+                        // I/O -- and was being called directly on this async
+                        // task, blocking whatever worker thread happened to
+                        // be running it (and every other task scheduled on
+                        // that same thread) for the duration. `spawn_blocking`
+                        // moves it to Tokio's dedicated blocking-task pool
+                        // instead, the standard fix for exactly this case.
+                        let memory_md_result = tokio::task::spawn_blocking(
+                            crate::memory_consolidator::run_memory_md_consolidation,
+                        )
+                        .await
+                        .unwrap_or_else(|join_err| {
+                            Err(anyhow::anyhow!(
+                                "MEMORY.md consolidation task panicked: {join_err}"
+                            ))
+                        });
+                        if let Err(e) = memory_md_result {
                             logging::error(&format!(
                                 "Ambient: MEMORY.md consolidation failed: {e}"
                             ));

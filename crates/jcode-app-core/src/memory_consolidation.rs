@@ -462,11 +462,12 @@ pub async fn run_one_ambient_extraction(worker_id: &str) -> anyhow::Result<Optio
 ///
 /// A session with too few messages to be worth extracting from (same
 /// threshold `Agent::extract_session_memories` already uses,
-/// `MemoryManager::MIN_MESSAGES_FOR_EXTRACTION`) is reported as a genuine
-/// `Extracted` completion with zero memories, **not** a `Failed` retry
-/// candidate -- a short session doesn't grow more messages by waiting, so
-/// treating it as "nothing to do here, done" avoids the leasing primitive
-/// wastefully retrying it forever under backoff.
+/// `MemoryManager::MIN_MESSAGES_FOR_EXTRACTION`) is left entirely
+/// unfinalized -- neither `Extracted` nor `Failed` -- since "too few
+/// messages right now" can't be told apart from "still actively growing,
+/// just caught early" (see this function body's own doc comment on that
+/// exact bug and its rejected first fix attempt). The lease simply stays
+/// `Leased` and naturally becomes reclaimable again once it expires.
 ///
 /// Returns the number of memories actually stored on success. Errors
 /// (session failed to load, extraction itself failed) are both surfaced to
@@ -484,7 +485,45 @@ pub async fn extract_claimed_session(session_id: &str) -> anyhow::Result<usize> 
     };
 
     if session.messages.len() < crate::memory::MemoryManager::MIN_MESSAGES_FOR_EXTRACTION {
-        mark_extracted(session_id)?;
+        // **Real bug, caught by a final full-repo review before it could
+        // cause silent data loss, then a second real bug in that fix's own
+        // first attempt caught by a follow-up review of the fix itself**:
+        // unconditionally marking a too-short session `Extracted` here
+        // assumed "too few messages" always means a *finished*, genuinely
+        // short conversation. But ambient mode claims whatever candidate
+        // batch it happens to see this cycle -- that could just as easily
+        // be a session someone is actively typing into *right now*, caught
+        // mid-conversation before it grew past the threshold. Marking it
+        // `Extracted` permanently means ambient mode -- whose whole
+        // documented purpose is a retroactive safety net for a session that
+        // later crashes -- would never revisit it even after it grows to 50
+        // messages and then the terminal dies uncleanly (skipping the
+        // interactive CLI-exit extraction hook): exactly the scenario
+        // ambient mode exists to cover, silently defeated.
+        //
+        // The first fix attempt tried a recency check (only finalize a
+        // session quiet for a full lease-duration window) -- rejected on
+        // review: a user who steps away for a longer break (lunch, a
+        // meeting -- anything past that window) and then resumes hits the
+        // *identical* bug, just with a longer trigger window instead of a
+        // fixed one. There is no timeout that can distinguish "paused, will
+        // resume" from "actually finished" from message count and recency
+        // alone.
+        //
+        // Fixed properly by never finalizing a too-short session at all --
+        // simply return without calling `mark_extracted`/`mark_failed`,
+        // leaving the lease in its current `Leased` state so it naturally
+        // becomes reclaimable once that lease expires (the same
+        // self-healing "stays Leased, retried later" outcome already used a
+        // few lines below for a lease-bookkeeping write failure). This
+        // means a session that's genuinely finished and short gets
+        // re-checked again every lease window, forever -- but that check is
+        // just a cheap session load and message count, no LLM call, nowhere
+        // near the wasteful-retry cost the original design's own comment
+        // was actually worried about (which was about a *failed*
+        // extraction attempt being retried under backoff, not this
+        // near-free case) -- a real, bounded cost, and a far smaller one
+        // than the silent, permanent data loss this now avoids.
         return Ok(0);
     }
 
@@ -725,8 +764,27 @@ mod tests {
         session.save().expect("save seeded session");
     }
 
+
     #[tokio::test]
-    async fn extract_claimed_session_reports_a_too_short_session_as_extracted_not_failed() {
+    async fn extract_claimed_session_never_finalizes_a_too_short_session() {
+        // Regression for a real, high-severity bug (a final full-repo
+        // review caught the original version, then a follow-up review of
+        // that fix's own first attempt caught a second, subtler version of
+        // the identical bug): a too-short session must never be marked
+        // `Extracted` -- not unconditionally (the original bug: it might
+        // just be caught mid-conversation, not actually finished), and not
+        // even after a fixed "quiet long enough" window (the first fix's
+        // own bug: a user paused longer than any chosen window, e.g. over
+        // lunch, and then resumed, hits the identical failure). No
+        // message-count-plus-recency heuristic can tell "paused, will
+        // resume" apart from "actually done" -- so this proves the lease is
+        // simply left `Leased` (naturally reclaimable on a later cycle,
+        // forever, at near-zero cost) rather than ever finalized, for a
+        // too-short session regardless of how long it's been quiet. Ambient
+        // mode's whole documented purpose is a retroactive safety net for a
+        // session that crashes later -- permanently marking a too-short
+        // session `Extracted` on any timeline would silently defeat that
+        // for exactly the sessions caught earliest.
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         crate::env::set_var("JCODE_HOME", temp.path());
@@ -737,14 +795,14 @@ mod tests {
 
         let count = extract_claimed_session("short")
             .await
-            .expect("must succeed, not error, for a too-short session");
+            .expect("must succeed, not error, even when deferring a decision");
         assert_eq!(count, 0);
 
         let lease = lease_status("short").expect("status").expect("exists");
         assert_eq!(
             lease.status,
-            LeaseStatus::Extracted,
-            "too-short is a done outcome, not a failure to retry"
+            LeaseStatus::Leased,
+            "a too-short session must never be finalized -- it may still be growing, on any timeline"
         );
     }
 

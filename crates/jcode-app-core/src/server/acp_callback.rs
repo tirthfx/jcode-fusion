@@ -58,30 +58,34 @@ impl Drop for PendingCallbackGuard {
     }
 }
 
-/// Ask `session_id`'s connected client to do something and wait for its
-/// answer. Looks up that session's live `event_tx` from `swarm_members`
-/// (the same "reach a specific session's live connection from anywhere in
-/// the daemon" primitive already used elsewhere, e.g. swarm event fanout)
-/// -- a session with no live connection, or whose client never answers
-/// (doesn't understand `method`, or answers a different id), fails with a
-/// clear error rather than hanging forever past `timeout`.
-pub async fn send_acp_callback(
+/// The actual send-and-await logic for an ACP client callback, parameterized
+/// on an already-resolved sender. [`send_acp_callback_for_session`] is the
+/// one real caller -- it resolves the *specific* ACP client's own channel
+/// (not the generic, last-writer-wins `SwarmMember::event_tx`) before
+/// calling in here; see its own doc comment for the real multi-client-
+/// attachment bug that shape avoids.
+///
+/// **A real, no-longer-present intermediate wrapper, removed rather than
+/// left as dead code**: an earlier version of this function was reached via
+/// a `send_acp_callback(session_id, method, params, timeout, swarm_members)`
+/// wrapper that resolved `swarm_members.get(session_id).event_tx` itself --
+/// exactly the generic, last-writer-wins lookup that turned out to be
+/// wrong for a session with more than one live attachment. Once
+/// `send_acp_callback_for_session` was rewritten to resolve the ACP
+/// client's own channel directly instead, that wrapper had no real caller
+/// left anywhere (confirmed: a plain, non-test build reported it as
+/// genuinely dead code) -- deleted outright, along with its own dedicated
+/// tests, rather than kept around under `#[allow(dead_code)]` as a
+/// vestigial, easy-to-accidentally-call-again shape that reintroduces the
+/// exact bug this fix removed. Its test coverage (timeout, success, client
+/// error, pending-map cleanup) moved onto this function directly.
+async fn send_acp_callback_via_sender(
     session_id: &str,
     method: &str,
     params: Value,
     timeout: Duration,
-    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
 ) -> anyhow::Result<Value> {
-    let event_tx = {
-        let members = swarm_members.read().await;
-        members.get(session_id).map(|member| member.event_tx.clone())
-    };
-    let Some(event_tx) = event_tx else {
-        anyhow::bail!(
-            "session '{session_id}' has no live connection to relay an ACP callback through"
-        );
-    };
-
     let id = NEXT_CALLBACK_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
     {
@@ -237,9 +241,33 @@ pub async fn is_acp_session(session_id: &str) -> bool {
 /// panics) if the server hasn't registered its map yet, or the session
 /// isn't actually ACP-connected -- callers are expected to check
 /// [`is_acp_session`] first and only call this when it returned `true`;
-/// this function re-checks `send_acp_callback`'s own "session has no live
-/// connection" case regardless, so it's still safe to call without that
-/// check, just less informative about *why* it failed.
+/// this function re-checks the "session has no live connection" case
+/// regardless, so it's still safe to call without that check, just less
+/// informative about *why* it failed.
+///
+/// **Deliberately does not call `send_acp_callback`** -- a real, high-severity
+/// bug a final full-repo Gemini review caught before this shipped: a session
+/// can have *more than one* live client attached at once (an ACP-connected
+/// editor with a TUI also opened to monitor the same session is a completely
+/// ordinary jcode workflow, not an edge case). `SwarmMember::event_tx` is
+/// last-writer-wins across every attachment (`client_session.rs`'s
+/// `Subscribe` handling unconditionally overwrites it on each new
+/// attachment) -- so if the TUI attached *after* the ACP client, `event_tx`
+/// now points at the TUI, not the ACP client, even though `is_acp_session`
+/// correctly still reports the session as ACP-connected (it checks
+/// `client_connections`, a different, correctly multi-entry-aware source).
+/// Routing through `event_tx` would silently dispatch `fs/read_text_file`/
+/// `fs/write_text_file` to the TUI, which doesn't understand it and drops
+/// it -- the tool call would hang for the full timeout and fail, for a
+/// perfectly ordinary multi-client session.
+///
+/// Fixed by resolving the *specific* ACP client's own channel: find its
+/// `client_id` from `client_connections` (the same live, multi-entry-aware
+/// map `is_acp_session` already reads), then look that id up in
+/// `SwarmMember::event_txs` (the per-connection map every attachment is
+/// *also* recorded in, alongside the legacy single `event_tx` -- this map
+/// was already there for exactly this kind of "reach one specific
+/// connection, not whichever is primary" need elsewhere in the daemon).
 pub async fn send_acp_callback_for_session(
     session_id: &str,
     method: &str,
@@ -249,7 +277,54 @@ pub async fn send_acp_callback_for_session(
     let Some(members) = registered_swarm_members() else {
         anyhow::bail!("ACP callback dispatcher not initialized (server not fully started?)");
     };
-    send_acp_callback(session_id, method, params, timeout, members).await
+    let Some(connections) = registered_client_connections() else {
+        anyhow::bail!("ACP callback dispatcher not initialized (server not fully started?)");
+    };
+
+    // A final full-repo review's own follow-up re-review caught a real,
+    // if low-severity, issue in an earlier version of this: `.values()` on
+    // a `HashMap` iterates in an *unspecified*, not-even-stable-across-calls
+    // order, so a session with two simultaneous ACP clients attached at
+    // once (e.g. the same project opened in two editor windows -- unusual,
+    // but not the multi-client scenario this fix was actually written for,
+    // which is one ACP client plus a non-ACP one like a TUI) would have
+    // gotten a *randomly* different client on each call, bouncing callbacks
+    // unpredictably between them. `min_by_key` on `connected_at` makes the
+    // choice deterministic instead -- the earliest-attached ACP client is
+    // treated as the session's primary one -- trading "no real, defined
+    // behavior for two-ACP-clients-at-once" for at least a stable, sensible
+    // one, without pretending to fully solve routing across simultaneous
+    // multi-ACP-client sessions in general.
+    let acp_client_id = {
+        connections
+            .read()
+            .await
+            .values()
+            .filter(|info| {
+                info.session_id == session_id && info.client_instance_id.as_deref() == Some("acp")
+            })
+            .min_by_key(|info| info.connected_at)
+            .map(|info| info.client_id.clone())
+    };
+    let Some(acp_client_id) = acp_client_id else {
+        anyhow::bail!(
+            "session '{session_id}' has no ACP-connected client to relay an ACP callback through"
+        );
+    };
+
+    let event_tx = {
+        let members = members.read().await;
+        members
+            .get(session_id)
+            .and_then(|member| member.event_txs.get(&acp_client_id).cloned())
+    };
+    let Some(event_tx) = event_tx else {
+        anyhow::bail!(
+            "session '{session_id}'s ACP client (connection '{acp_client_id}') has no live event channel to relay an ACP callback through"
+        );
+    };
+
+    send_acp_callback_via_sender(session_id, method, params, timeout, event_tx).await
 }
 
 /// Test-only accessor for the registered `swarm_members` map, tolerant of
@@ -334,15 +409,26 @@ pub(crate) fn test_acp_client_connection(session_id: &str) -> ClientConnectionIn
 /// (`tool/write.rs`'s and `tool/read.rs`'s own tests need one too, to
 /// exercise `send_acp_callback_for_session`/`is_acp_session` end to end).
 /// Moved to module scope rather than duplicated per test module.
+///
+/// `event_txs` is populated (not left empty) with an entry keyed by the same
+/// `client_id` [`test_acp_client_connection`] uses (`client-for-{session_id}`)
+/// -- required since `send_acp_callback_for_session` now resolves the ACP
+/// client's *specific* channel via `event_txs`, not the generic `event_tx`
+/// (the multi-client-routing bug fix documented on that function). Both
+/// helpers are expected to be used together, so keeping their ids in sync
+/// here (rather than each independently inventing one) is what makes that
+/// actually true rather than coincidental.
 #[cfg(test)]
 pub(crate) fn test_swarm_member(
     session_id: &str,
     event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
 ) -> SwarmMember {
+    let mut event_txs = HashMap::new();
+    event_txs.insert(format!("client-for-{session_id}"), event_tx.clone());
     SwarmMember {
         session_id: session_id.to_string(),
         event_tx,
-        event_txs: HashMap::new(),
+        event_txs,
         working_dir: None,
         swarm_id: None,
         swarm_enabled: false,
@@ -368,48 +454,38 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    fn test_member(event_tx: mpsc::UnboundedSender<ServerEvent>) -> SwarmMember {
-        test_swarm_member("sess-1", event_tx)
-    }
-
     #[tokio::test]
-    async fn send_acp_callback_fails_cleanly_for_an_unknown_session() {
-        let swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let result = send_acp_callback(
-            "no-such-session",
+    async fn send_acp_callback_for_session_fails_cleanly_when_no_client_is_registered() {
+        // The "unknown session" case, now at the real entry point
+        // (`send_acp_callback_for_session`) rather than the removed
+        // `send_acp_callback` wrapper: nothing registered in
+        // `client_connections` for this session id at all.
+        let _members = ensure_swarm_members_registered_for_test();
+        let _connections = ensure_client_connections_registered_for_test();
+        let result = send_acp_callback_for_session(
+            "no-such-session-at-all",
             "fs/read_text_file",
             serde_json::json!({"path": "/tmp/x"}),
             Duration::from_millis(50),
-            &swarm_members,
         )
         .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn send_acp_callback_sends_the_event_and_resolves_on_a_matching_response() {
+    async fn send_acp_callback_via_sender_sends_the_event_and_resolves_on_a_matching_response() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        swarm_members
-            .write()
-            .await
-            .insert("sess-1".to_string(), test_member(event_tx));
 
-        let call = {
-            let swarm_members = Arc::clone(&swarm_members);
-            tokio::spawn(async move {
-                send_acp_callback(
-                    "sess-1",
-                    "fs/read_text_file",
-                    serde_json::json!({"path": "/tmp/x"}),
-                    Duration::from_secs(5),
-                    &swarm_members,
-                )
-                .await
-            })
-        };
+        let call = tokio::spawn(async move {
+            send_acp_callback_via_sender(
+                "sess-1",
+                "fs/read_text_file",
+                serde_json::json!({"path": "/tmp/x"}),
+                Duration::from_secs(5),
+                event_tx,
+            )
+            .await
+        });
 
         let event = event_rx.recv().await.expect("event sent");
         let ServerEvent::AcpCallbackRequest { id, method, params } = event else {
@@ -425,28 +501,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_acp_callback_surfaces_a_client_error() {
+    async fn send_acp_callback_via_sender_surfaces_a_client_error() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        swarm_members
-            .write()
-            .await
-            .insert("sess-1".to_string(), test_member(event_tx));
 
-        let call = {
-            let swarm_members = Arc::clone(&swarm_members);
-            tokio::spawn(async move {
-                send_acp_callback(
-                    "sess-1",
-                    "fs/read_text_file",
-                    serde_json::json!({}),
-                    Duration::from_secs(5),
-                    &swarm_members,
-                )
-                .await
-            })
-        };
+        let call = tokio::spawn(async move {
+            send_acp_callback_via_sender(
+                "sess-1",
+                "fs/read_text_file",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+                event_tx,
+            )
+            .await
+        });
 
         let event = event_rx.recv().await.expect("event sent");
         let ServerEvent::AcpCallbackRequest { id, .. } = event else {
@@ -459,21 +526,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_acp_callback_times_out_cleanly_and_cleans_up_its_pending_entry() {
+    async fn send_acp_callback_via_sender_times_out_cleanly_and_cleans_up_its_pending_entry() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        swarm_members
-            .write()
-            .await
-            .insert("sess-1".to_string(), test_member(event_tx));
 
-        let result = send_acp_callback(
+        let result = send_acp_callback_via_sender(
             "sess-1",
             "fs/read_text_file",
             serde_json::json!({}),
             Duration::from_millis(50),
-            &swarm_members,
+            event_tx,
         )
         .await;
         assert!(result.is_err(), "must time out, not hang forever");
@@ -492,5 +553,75 @@ mod tests {
         // Must not panic on an id nothing is waiting for -- e.g. already
         // timed out, or an id the client made up.
         resolve_acp_callback(u64::MAX, Ok(serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn send_acp_callback_for_session_routes_to_the_acp_client_specifically_not_whichever_attached_last()
+     {
+        // Regression test for a real, high-severity bug a final full-repo
+        // review caught before it shipped: a session can have more than one
+        // live client attached at once (an ACP-connected editor with a TUI
+        // also opened to monitor the same session is an ordinary jcode
+        // workflow, not a contrived edge case). `SwarmMember::event_tx` is
+        // last-writer-wins across *every* attachment (real `Subscribe`
+        // handling in `client_session.rs` unconditionally overwrites it on
+        // each new one) -- so if a second, non-ACP client attaches *after*
+        // the ACP one, `event_tx` now points at it instead, even though the
+        // session is still genuinely ACP-connected. This proves
+        // `send_acp_callback_for_session` reaches the ACP client's own
+        // channel via `event_txs` regardless of which channel `event_tx`
+        // currently happens to point at.
+        let session_id = "multi-client-acp-test-session";
+        let acp_client_id = format!("client-for-{session_id}");
+
+        let (acp_tx, mut acp_rx) = mpsc::unbounded_channel();
+        let (tui_tx, mut tui_rx) = mpsc::unbounded_channel();
+
+        let members = ensure_swarm_members_registered_for_test();
+        {
+            let mut members = members.write().await;
+            let mut member = test_swarm_member(session_id, acp_tx);
+            // Simulate a second client (e.g. a TUI) attaching *after* the
+            // ACP one, exactly the way real Subscribe handling does: it
+            // overwrites the generic `event_tx` and adds its own
+            // `event_txs` entry, but never touches the ACP client's own
+            // entry.
+            member.event_tx = tui_tx.clone();
+            member.event_txs.insert("tui-connection".to_string(), tui_tx);
+            members.insert(session_id.to_string(), member);
+        }
+
+        let connections = ensure_client_connections_registered_for_test();
+        connections
+            .write()
+            .await
+            .insert(acp_client_id, test_acp_client_connection(session_id));
+
+        let call = tokio::spawn(async move {
+            send_acp_callback_for_session(
+                session_id,
+                "fs/read_text_file",
+                serde_json::json!({"path": "/tmp/x"}),
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        let event = acp_rx
+            .recv()
+            .await
+            .expect("the ACP client, not the TUI, must receive the callback");
+        let ServerEvent::AcpCallbackRequest { id, .. } = event else {
+            panic!("expected AcpCallbackRequest, got {event:?}");
+        };
+        resolve_acp_callback(id, Ok(serde_json::json!({"content": "real content"})));
+
+        let result = call.await.expect("task").expect("should resolve");
+        assert_eq!(result, serde_json::json!({"content": "real content"}));
+
+        assert!(
+            tui_rx.try_recv().is_err(),
+            "the TUI (a non-ACP client that attached later) must never receive an ACP callback"
+        );
     }
 }
