@@ -12,18 +12,35 @@
 //! shipped the write path alone before budget/verification/supervisor
 //! followed in later slices).
 //!
-//! **Deliberately not in this slice, not silently pretended solved**:
-//! - No actual memory-extraction logic. `claim_next_eligible` only decides
-//!   *which* session a worker should process next — it doesn't run an LLM
-//!   turn or touch `MemoryManager`/`MemoryGraph` itself. That's the natural
-//!   next slice, once this primitive exists to build it on.
+//! **Second slice, same session (2026-08-30): real extraction, not a new
+//! LLM pipeline built from scratch.** `extract_claimed_session` wires the
+//! leasing primitive above to jcode's own already-existing, already-shipped
+//! `MemoryManager::extract_from_transcript` (Haiku-sidecar-based) — a real
+//! function that, before this slice, had **zero callers anywhere in the
+//! codebase** (confirmed via grep before writing anything: the exact same
+//! "orphaned but shaped right" pattern Mission Engine's own first slice
+//! found in `mission.rs`). The only prior caller of the underlying
+//! extraction *mechanism* at all was `Agent::extract_session_memories`
+//! (`agent/turn_execution.rs`) — but only from one narrow path, an
+//! interactive CLI session's own normal exit, never retroactively for a
+//! TUI/headless/swarm session that closed, crashed, or was simply never
+//! revisited. That gap (`docs/MEMORY_ARCHITECTURE.md`'s own "Retroactive
+//! session extraction (crashed/missed sessions)" checklist item) is exactly
+//! what this slice closes: the transcript-building logic that lone call
+//! site used was factored out to `crate::memory::transcript_from_messages`
+//! (jcode-base) so both a live `Agent` and a session freshly loaded from
+//! disk with no live agent at all (this module's own case) build the
+//! identical transcript shape from one place, not two copies drifting apart.
+//!
+//! **Still deliberately not in this slice**:
 //! - No wiring into the ambient runner. Per the resolved scheduler question
 //!   in `PROGRESS.md`, memory consolidation's periodic-loop piece should
 //!   model on Ambient Mode's existing runner (a real, working periodic-loop
 //!   primitive) rather than Mission Engine's supervisor — but that wiring
-//!   is separate work, not attempted here.
+//!   is separate work, not attempted here. `extract_claimed_session` is
+//!   callable and tested standing alone; nothing calls it automatically yet.
 //! - No phase-2 consolidator (the single-global-lock sub-agent that writes
-//!   `MEMORY.md`/`skills/`). This module only covers phase 1's leasing.
+//!   `MEMORY.md`/`skills/`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -285,6 +302,76 @@ pub fn lease_status(session_id: &str) -> anyhow::Result<Option<SessionLease>> {
     Ok(store.leases.get(session_id).cloned())
 }
 
+/// Run a real extraction pass on a session this worker already holds the
+/// lease for (via [`claim_next_eligible`]), reporting the outcome back to
+/// the leasing primitive itself -- callers don't need to separately call
+/// `mark_extracted`/`mark_failed`, this does it for them either way.
+///
+/// A session with too few messages to be worth extracting from (same
+/// threshold `Agent::extract_session_memories` already uses,
+/// `MemoryManager::MIN_MESSAGES_FOR_EXTRACTION`) is reported as a genuine
+/// `Extracted` completion with zero memories, **not** a `Failed` retry
+/// candidate -- a short session doesn't grow more messages by waiting, so
+/// treating it as "nothing to do here, done" avoids the leasing primitive
+/// wastefully retrying it forever under backoff.
+///
+/// Returns the number of memories actually stored on success. Errors
+/// (session failed to load, extraction itself failed) are both surfaced to
+/// the caller *and* recorded via `mark_failed` before returning, so a
+/// caller that just wants "did this work" doesn't have to remember to call
+/// `mark_failed` itself on every error path.
+pub async fn extract_claimed_session(session_id: &str) -> anyhow::Result<usize> {
+    let session = match crate::session::Session::load(session_id) {
+        Ok(session) => session,
+        Err(err) => {
+            let message = format!("failed to load session: {err:#}");
+            mark_failed(session_id, &message).ok();
+            return Err(anyhow::anyhow!(message));
+        }
+    };
+
+    if session.messages.len() < crate::memory::MemoryManager::MIN_MESSAGES_FOR_EXTRACTION {
+        mark_extracted(session_id)?;
+        return Ok(0);
+    }
+
+    let transcript = crate::memory::transcript_from_messages(&session.messages);
+    let manager = session
+        .working_dir
+        .as_deref()
+        .map(|dir| crate::memory::MemoryManager::new().with_project_dir(dir))
+        .unwrap_or_default();
+
+    match manager.extract_from_transcript(&transcript, session_id).await {
+        Ok(extracted) => {
+            // Gemini review, 2026-08-30: extraction genuinely succeeded by
+            // this point -- any memories it found are already persisted by
+            // extract_from_transcript itself. A `?` here would let a
+            // failure to write the *lease bookkeeping* (e.g. a transient
+            // disk error) masquerade as an extraction failure and discard
+            // the real, already-true success. Log and proceed instead: the
+            // lease simply stays Leased and naturally becomes reclaimable
+            // once it expires (see `is_eligible`), which at worst means a
+            // future retry re-extracts the same session -- a bounded,
+            // self-healing outcome (possible duplicate memories), not lost
+            // extraction work or a permanently stuck lease.
+            if let Err(err) = mark_extracted(session_id) {
+                crate::logging::warn(&format!(
+                    "extract_claimed_session: extraction for '{session_id}' succeeded but \
+                     recording it as Extracted failed ({err:#}) -- lease will expire and may \
+                     be retried"
+                ));
+            }
+            Ok(extracted.len())
+        }
+        Err(err) => {
+            let message = format!("extraction failed: {err:#}");
+            mark_failed(session_id, &message).ok();
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +548,107 @@ mod tests {
         with_isolated_home(|| {
             assert!(lease_status("never-claimed").expect("status").is_none());
         });
+    }
+
+    // --- extract_claimed_session ---
+
+    fn seeded_session(session_id: &str, message_count: usize) {
+        let mut session =
+            crate::session::Session::create_with_id(session_id.to_string(), None, None);
+        for i in 0..message_count {
+            let role = if i % 2 == 0 {
+                jcode_message_types::Role::User
+            } else {
+                jcode_message_types::Role::Assistant
+            };
+            session.add_message(
+                role,
+                vec![jcode_message_types::ContentBlock::Text {
+                    text: format!("message {i}"),
+                    cache_control: None,
+                }],
+            );
+        }
+        session.save().expect("save seeded session");
+    }
+
+    #[tokio::test]
+    async fn extract_claimed_session_reports_a_too_short_session_as_extracted_not_failed() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        seeded_session("short", 2); // below MIN_MESSAGES_FOR_EXTRACTION (4)
+        claim_next_eligible(&["short".to_string()], "worker-1", DEFAULT_LEASE_DURATION)
+            .expect("claim");
+
+        let count = extract_claimed_session("short")
+            .await
+            .expect("must succeed, not error, for a too-short session");
+        assert_eq!(count, 0);
+
+        let lease = lease_status("short").expect("status").expect("exists");
+        assert_eq!(
+            lease.status,
+            LeaseStatus::Extracted,
+            "too-short is a done outcome, not a failure to retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_claimed_session_marks_failed_when_the_session_cannot_be_loaded() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        // Never seeded/saved -- Session::load must fail for it.
+        claim_next_eligible(
+            &["nonexistent".to_string()],
+            "worker-1",
+            DEFAULT_LEASE_DURATION,
+        )
+        .expect("claim");
+
+        let result = extract_claimed_session("nonexistent").await;
+        assert!(result.is_err(), "must surface the load failure to the caller");
+
+        let lease = lease_status("nonexistent")
+            .expect("status")
+            .expect("exists");
+        assert_eq!(lease.status, LeaseStatus::Failed);
+        assert_eq!(lease.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn extract_claimed_session_marks_extracted_when_the_llm_judge_is_unavailable() {
+        // A long-enough session in a test environment with no LLM backend
+        // configured takes extract_from_transcript's own graceful "judge
+        // unavailable, return no memories" path (not an error) -- this
+        // exercises the real, non-mocked function, matching this project's
+        // usual "genuinely tests without needing live credentials" bar.
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        seeded_session("long-enough", 6);
+        claim_next_eligible(
+            &["long-enough".to_string()],
+            "worker-1",
+            DEFAULT_LEASE_DURATION,
+        )
+        .expect("claim");
+
+        let count = extract_claimed_session("long-enough")
+            .await
+            .expect("must succeed cleanly with no LLM backend configured");
+        assert_eq!(
+            count, 0,
+            "no backend available -- extract_from_transcript's own graceful no-op path"
+        );
+
+        let lease = lease_status("long-enough")
+            .expect("status")
+            .expect("exists");
+        assert_eq!(lease.status, LeaseStatus::Extracted);
     }
 }

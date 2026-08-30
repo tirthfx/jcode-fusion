@@ -185,6 +185,81 @@ impl MemoryEntryEmbeddingExt for MemoryEntry {
     }
 }
 
+/// Render a session's stored messages into the plain-text transcript
+/// [`MemoryManager::extract_from_transcript`]/`Sidecar::extract_memories`
+/// expect. Factored out of `Agent::extract_session_memories`
+/// (`jcode-app-core`, the one existing call site -- an interactive CLI
+/// session's own exit path) so a second caller (Fusion's Phase 4
+/// background/ambient extraction, which has a freshly-`Session::load`ed
+/// session with no live `Agent` at all) can build the exact same transcript
+/// shape without duplicating this logic, or the two silently drifting apart
+/// over time.
+pub fn transcript_from_messages(messages: &[jcode_session_types::StoredMessage]) -> String {
+    use jcode_message_types::{ContentBlock, Role};
+
+    let mut transcript = String::new();
+    for msg in messages {
+        let role = match msg.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+        };
+        transcript.push_str(&format!("**{role}:**\n"));
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text, .. } => {
+                    if text.trim_start().starts_with("<system-reminder>") {
+                        continue;
+                    }
+                    transcript.push_str(text);
+                    transcript.push('\n');
+                }
+                ContentBlock::ToolUse { name, .. } => {
+                    transcript.push_str(&format!("[Used tool: {name}]\n"));
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    // Gemini review, 2026-08-30: an unconditional
+                    // `content.chars().count()` is a full O(N) scan before
+                    // truncation even runs -- a real CPU cost for a
+                    // multi-megabyte tool result (exactly the kind of
+                    // content this preview exists to shrink). Byte length
+                    // is checked first (O(1), and always an upper bound on
+                    // char count), so the common short-result case never
+                    // touches the iterator at all; only a byte length over
+                    // 200 falls through to the bounded, safe-on-UTF-8-
+                    // boundaries char walk.
+                    let preview = if content.len() > 200 {
+                        let mut chars = content.chars();
+                        let truncated: String = chars.by_ref().take(200).collect();
+                        if chars.next().is_some() {
+                            format!("{truncated}...")
+                        } else {
+                            // More than 200 bytes but <= 200 chars (wide
+                            // multi-byte content) -- nothing was actually
+                            // cut, so no ellipsis.
+                            content.clone()
+                        }
+                    } else {
+                        content.clone()
+                    };
+                    transcript.push_str(&format!("[Result: {preview}]\n"));
+                }
+                ContentBlock::Reasoning { .. }
+                | ContentBlock::ReasoningTrace { .. }
+                | ContentBlock::AnthropicThinking { .. }
+                | ContentBlock::OpenAIReasoning { .. } => {}
+                ContentBlock::Image { .. } => {
+                    transcript.push_str("[Image]\n");
+                }
+                ContentBlock::OpenAICompaction { .. } => {
+                    transcript.push_str("[OpenAI native compaction]\n");
+                }
+            }
+        }
+        transcript.push('\n');
+    }
+    transcript
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryManager {
     project_dir: Option<PathBuf>,
@@ -1110,6 +1185,13 @@ impl MemoryManager {
     }
 
     // === Sidecar Integration ===
+
+    /// Fewer than this many messages isn't considered worth a real
+    /// extraction pass -- matches `Agent::extract_session_memories`'s own
+    /// existing threshold (the interactive-CLI-exit call site this was
+    /// factored out of), kept as one shared constant so the two call sites
+    /// can't silently drift apart.
+    pub const MIN_MESSAGES_FOR_EXTRACTION: usize = 4;
 
     /// Extract memories from a session transcript using the Haiku sidecar
     pub async fn extract_from_transcript(

@@ -963,7 +963,8 @@ impl Agent {
         }
 
         // Need at least 4 messages for meaningful extraction
-        if self.session.messages.len() < 4 {
+        if self.session.messages.len() < crate::memory::MemoryManager::MIN_MESSAGES_FOR_EXTRACTION
+        {
             return 0;
         }
 
@@ -972,48 +973,14 @@ impl Agent {
             self.session.messages.len()
         ));
 
-        // Build transcript
-        let mut transcript = String::new();
-        for msg in &self.session.messages {
-            let role = match msg.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-            };
-            transcript.push_str(&format!("**{}:**\n", role));
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text, .. } => {
-                        if text.trim_start().starts_with("<system-reminder>") {
-                            continue;
-                        }
-                        transcript.push_str(text);
-                        transcript.push('\n');
-                    }
-                    ContentBlock::ToolUse { name, .. } => {
-                        transcript.push_str(&format!("[Used tool: {}]\n", name));
-                    }
-                    ContentBlock::ToolResult { content, .. } => {
-                        let preview = if content.len() > 200 {
-                            format!("{}...", crate::util::truncate_str(content, 200))
-                        } else {
-                            content.clone()
-                        };
-                        transcript.push_str(&format!("[Result: {}]\n", preview));
-                    }
-                    ContentBlock::Reasoning { .. }
-                    | ContentBlock::ReasoningTrace { .. }
-                    | ContentBlock::AnthropicThinking { .. }
-                    | ContentBlock::OpenAIReasoning { .. } => {}
-                    ContentBlock::Image { .. } => {
-                        transcript.push_str("[Image]\n");
-                    }
-                    ContentBlock::OpenAICompaction { .. } => {
-                        transcript.push_str("[OpenAI native compaction]\n");
-                    }
-                }
-            }
-            transcript.push('\n');
-        }
+        // Gemini Bug Scan follow-up (Phase 4, 2026-08-30): this transcript
+        // build used to be duplicated inline here. Factored out to
+        // `crate::memory::transcript_from_messages` (jcode-base) so Fusion's
+        // background/ambient extraction slice -- which loads a session from
+        // disk with no live `Agent` at all -- builds the exact same
+        // transcript shape from the same one place, rather than a second
+        // copy silently drifting from this one over time.
+        let transcript = crate::memory::transcript_from_messages(&self.session.messages);
 
         if !crate::memory::memory_llm_judge_available() {
             logging::info("Memory extraction skipped: LLM judge unavailable");

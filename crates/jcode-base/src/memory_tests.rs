@@ -4,6 +4,110 @@ use super::*;
 fn manager_without_project_dir_does_not_use_process_cwd() {
     assert!(MemoryManager::new().get_project_dir().is_none());
 }
+
+fn stored_message(role: crate::message::Role, content: Vec<ContentBlock>) -> jcode_session_types::StoredMessage {
+    jcode_session_types::StoredMessage {
+        id: "msg-1".to_string(),
+        role,
+        content,
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    }
+}
+
+#[test]
+fn transcript_from_messages_renders_role_labels_and_text() {
+    let messages = vec![
+        stored_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "hello".to_string(),
+                cache_control: None,
+            }],
+        ),
+        stored_message(
+            Role::Assistant,
+            vec![ContentBlock::Text {
+                text: "hi there".to_string(),
+                cache_control: None,
+            }],
+        ),
+    ];
+    let transcript = transcript_from_messages(&messages);
+    assert!(transcript.contains("**User:**\nhello"));
+    assert!(transcript.contains("**Assistant:**\nhi there"));
+}
+
+#[test]
+fn transcript_from_messages_skips_system_reminder_text_blocks() {
+    let messages = vec![stored_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "<system-reminder>internal only</system-reminder>".to_string(),
+            cache_control: None,
+        }],
+    )];
+    let transcript = transcript_from_messages(&messages);
+    assert!(!transcript.contains("internal only"));
+}
+
+#[test]
+fn transcript_from_messages_leaves_a_short_tool_result_untruncated() {
+    // Gemini review regression, 2026-08-30: short_content.len() <= 200
+    // bytes must skip the truncation branch entirely -- no ellipsis.
+    let short = "x".repeat(50);
+    let messages = vec![stored_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolResult {
+            content: short.clone(),
+            tool_use_id: "call-1".to_string(),
+            is_error: None,
+        }],
+    )];
+    let transcript = transcript_from_messages(&messages);
+    assert!(transcript.contains(&format!("[Result: {short}]")));
+    assert!(!transcript.contains("..."));
+}
+
+#[test]
+fn transcript_from_messages_truncates_a_long_tool_result_at_200_chars() {
+    let long = "y".repeat(500);
+    let messages = vec![stored_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolResult {
+            content: long,
+            tool_use_id: "call-1".to_string(),
+            is_error: None,
+        }],
+    )];
+    let transcript = transcript_from_messages(&messages);
+    let expected_preview = format!("[Result: {}...]", "y".repeat(200));
+    assert!(transcript.contains(&expected_preview));
+}
+
+#[test]
+fn transcript_from_messages_does_not_add_an_ellipsis_for_wide_multi_byte_content_under_200_chars() {
+    // Gemini review regression, 2026-08-30: this is > 200 *bytes* (each
+    // multi-byte char is 3 bytes here) but only 100 *chars* -- must not be
+    // truncated or get a spurious ellipsis, exercising the byte-length
+    // fast-path's "false positive" case specifically.
+    let wide = "€".repeat(100); // 300 bytes, 100 chars
+    assert!(wide.len() > 200);
+    assert_eq!(wide.chars().count(), 100);
+    let messages = vec![stored_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolResult {
+            content: wide.clone(),
+            tool_use_id: "call-1".to_string(),
+            is_error: None,
+        }],
+    )];
+    let transcript = transcript_from_messages(&messages);
+    assert!(transcript.contains(&format!("[Result: {wide}]")));
+    assert!(!transcript.contains("..."));
+}
 use crate::message::{ContentBlock, Message, Role};
 use serde_json::json;
 use std::fs;
