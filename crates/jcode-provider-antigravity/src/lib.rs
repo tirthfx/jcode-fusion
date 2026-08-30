@@ -643,12 +643,8 @@ mod tests {
 
     #[test]
     fn x_goog_api_client_falls_back_to_the_hardcoded_default() {
-        // Not touching the real env var here (that would race other tests in
-        // this process); this only pins the fallback branch's value.
-        assert_eq!(
-            resolve_api_client_override(std::env::var("JCODE_ANTIGRAVITY_API_CLIENT_DOES_NOT_EXIST").ok())
-                .unwrap_or_else(|| X_GOOG_API_CLIENT.to_string()),
-            X_GOOG_API_CLIENT
-        );
+        // No test in this binary sets JCODE_ANTIGRAVITY_API_CLIENT, so calling
+        // the real function directly can't race with another test's env var.
+        assert_eq!(x_goog_api_client(), X_GOOG_API_CLIENT);
     }
 }
