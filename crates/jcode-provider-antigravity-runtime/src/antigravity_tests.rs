@@ -671,6 +671,30 @@ fn pseudo_tool_call_turn_only_matches_the_recovery_marker_as_a_call() {
     ));
 }
 
+#[test]
+fn rate_limit_error_message_explains_it_is_not_real_quota_exhaustion() {
+    let message = antigravity_rate_limit_error_message(4, "Resource has been exhausted");
+
+    // States the attempt count and preserves the original backend body.
+    assert!(message.contains("4 attempt(s)"));
+    assert!(message.contains("Resource has been exhausted"));
+    // The whole point of this message: tell the user this is unlikely to be
+    // their account's real quota, not a silent generic HTTP error.
+    assert!(message.contains("NOT real account quota exhaustion"));
+    assert!(message.contains("Antigravity IDE"));
+    // Points at the concrete escape hatch this fix adds.
+    assert!(message.contains("JCODE_ANTIGRAVITY_API_CLIENT"));
+}
+
+#[test]
+fn rate_limit_constants_bound_retries_to_a_handful_of_attempts() {
+    // A sanity bound so a future edit can't accidentally turn this into an
+    // unbounded retry loop against a real, currently-429ing backend.
+    assert!(RATE_LIMIT_MAX_ATTEMPTS >= 2);
+    assert!(RATE_LIMIT_MAX_ATTEMPTS <= 6);
+    assert!(RATE_LIMIT_BASE_DELAY_MS >= 500);
+}
+
 /// End-to-end guard for the turn-2 HTTP 404: `--provider antigravity` gives the
 /// agent this runtime directly, and session restore calls `set_model` with the
 /// routing spec `antigravity:<model>`. The id we store is the id we put on the

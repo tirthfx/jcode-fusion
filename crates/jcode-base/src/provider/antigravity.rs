@@ -22,7 +22,7 @@ pub use jcode_provider_antigravity::{
     FetchAvailableModelsResponse, GENERATE_CONTENT_API_URL, PersistedCatalog, X_GOOG_API_CLIENT,
     antigravity_compatible_schema, antigravity_user_agent, catalog_is_stale, catalog_model_detail,
     client_metadata_header, is_retryable_empty_turn, merge_antigravity_model_ids,
-    parse_fetch_available_models_response, remap_unsupported_model,
+    parse_fetch_available_models_response, remap_unsupported_model, x_goog_api_client,
 };
 
 /// Path of the persisted warm-catalog cache shared by the runtime crate and
@@ -82,7 +82,7 @@ async fn fetch_available_models_with_project(
         .header(reqwest::header::USER_AGENT, antigravity_user_agent())
         .header(
             reqwest::header::HeaderName::from_static("x-goog-api-client"),
-            X_GOOG_API_CLIENT,
+            x_goog_api_client(),
         )
         .header(
             reqwest::header::HeaderName::from_static("client-metadata"),

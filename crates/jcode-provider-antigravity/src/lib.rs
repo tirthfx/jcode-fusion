@@ -24,7 +24,33 @@ pub const GENERATE_CONTENT_API_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
 const VERSION_ENV: &str = "JCODE_ANTIGRAVITY_VERSION";
 pub const ANTIGRAVITY_VERSION: &str = "1.18.3";
+/// Default `x-goog-api-client` client-identity header value, sent on every
+/// Antigravity request (`generateContent` and `fetchAvailableModels` alike).
+///
+/// This is not a guess: independently reverse-engineered documentation of the
+/// real Antigravity IDE's own wire protocol (e.g. the `opencode-antigravity-auth`
+/// and `PicoClaw` projects) records the genuine client sending this exact
+/// string, so it correctly self-identifies as Antigravity rather than some
+/// unrelated or obviously-fake product.
+///
+/// That said, it is a hardcoded literal that many independent third-party
+/// Antigravity clients (this one included) all copy verbatim, and there are
+/// multiple, still-unresolved public reports of exactly the symptom this was
+/// investigated for: `HTTP 429 RESOURCE_EXHAUSTED` from `generateContent` on
+/// an account whose quota dashboard *and* `fetchAvailableModels` quota both
+/// show plenty of headroom, while the official Antigravity IDE keeps working
+/// against the very same account at the very same time (see e.g.
+/// `router-for-me/CLIProxyAPI` issues #910 and #1015, and
+/// `NoeFabris/opencode-antigravity-auth` issue #135). That is consistent with
+/// Google enforcing some additional rate/quota bucket keyed on client
+/// identity or abuse heuristics that the account-level quota surfaces never
+/// report — but no public source pins down the exact mechanism, and no
+/// investigation (including this one) has produced real evidence that a
+/// *different* header value avoids it. So the default here is left
+/// unchanged; use [`x_goog_api_client`] (backed by `JCODE_ANTIGRAVITY_API_CLIENT`)
+/// if you want to experiment with an override without a jcode release.
 pub const X_GOOG_API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
+const API_CLIENT_ENV: &str = "JCODE_ANTIGRAVITY_API_CLIENT";
 const CATALOG_REFRESH_TTL_HOURS: i64 = 6;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -122,6 +148,23 @@ pub fn antigravity_version() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ANTIGRAVITY_VERSION.to_string())
+}
+
+/// Trim a raw `JCODE_ANTIGRAVITY_API_CLIENT` env-var read down to a usable
+/// override, or `None` if it was unset/blank. Split out from
+/// [`x_goog_api_client`] so the trimming/blank-rejection rule is unit
+/// testable without touching real process environment.
+fn resolve_api_client_override(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Resolve the `x-goog-api-client` client-identity header value, honoring the
+/// `JCODE_ANTIGRAVITY_API_CLIENT` override. See [`X_GOOG_API_CLIENT`] for why
+/// the default is left as-is absent real evidence for a better one.
+pub fn x_goog_api_client() -> String {
+    resolve_api_client_override(std::env::var(API_CLIENT_ENV).ok())
+        .unwrap_or_else(|| X_GOOG_API_CLIENT.to_string())
 }
 
 pub fn antigravity_user_agent() -> String {
@@ -576,5 +619,36 @@ pub fn flatten_schema_combiners(schema: &Value) -> Value {
         }
         Value::Array(items) => Value::Array(items.iter().map(flatten_schema_combiners).collect()),
         _ => schema.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_client_override_ignores_unset_and_blank_values() {
+        assert_eq!(resolve_api_client_override(None), None);
+        assert_eq!(resolve_api_client_override(Some(String::new())), None);
+        assert_eq!(resolve_api_client_override(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn api_client_override_trims_a_real_value() {
+        assert_eq!(
+            resolve_api_client_override(Some("  custom-client/1.0  ".to_string())),
+            Some("custom-client/1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn x_goog_api_client_falls_back_to_the_hardcoded_default() {
+        // Not touching the real env var here (that would race other tests in
+        // this process); this only pins the fallback branch's value.
+        assert_eq!(
+            resolve_api_client_override(std::env::var("JCODE_ANTIGRAVITY_API_CLIENT_DOES_NOT_EXIST").ok())
+                .unwrap_or_else(|| X_GOOG_API_CLIENT.to_string()),
+            X_GOOG_API_CLIENT
+        );
     }
 }
