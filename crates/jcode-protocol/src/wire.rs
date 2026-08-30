@@ -289,6 +289,21 @@ pub enum Request {
         env: std::collections::HashMap<String, String>,
     },
 
+    /// A client's answer to a [`ServerEvent::AcpCallbackRequest`] the
+    /// daemon sent it (Phase 3, ACP client-callback delegation) --
+    /// `id` must match the request's own id. Exactly one of `result`/
+    /// `error` should be set, the same `result`/`error` shape
+    /// `send_client_request` on the ACP-adapter side already treats as
+    /// `Ok(Value)`/`Err(Value)`.
+    #[serde(rename = "acp_callback_response")]
+    AcpCallbackResponse {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<serde_json::Value>,
+    },
+
     /// Set reasoning effort for providers that expose it (OpenAI: none|minimal|low|medium|high|xhigh|max; Anthropic: none|low|medium|high|xhigh|max; DeepSeek: none|low|medium|high|max)
     #[serde(rename = "set_reasoning_effort")]
     SetReasoningEffort {
@@ -762,6 +777,24 @@ pub enum ServerEvent {
     /// Acknowledgment of request
     #[serde(rename = "ack")]
     Ack { id: u64 },
+
+    /// Server-initiated callback: the daemon needs the *client* to do
+    /// something and return a result -- an ACP host's `fs/read_text_file`
+    /// etc. (Phase 3, ACP client-callback delegation). This is the
+    /// daemon-to-client direction; the client answers with a
+    /// [`Request::AcpCallbackResponse`] carrying the same `id`. Only
+    /// meaningful to a client that actually understands how to answer a
+    /// given `method` (today: the ACP adapter, relaying to its own ACP
+    /// host via `send_client_request`) -- a client with no live connection,
+    /// or one that doesn't recognize `method`, simply never responds, and
+    /// the daemon-side caller (`send_acp_callback`) times out rather than
+    /// hanging forever.
+    #[serde(rename = "acp_callback_request")]
+    AcpCallbackRequest {
+        id: u64,
+        method: String,
+        params: serde_json::Value,
+    },
 
     /// Streaming text delta
     #[serde(rename = "text_delta")]

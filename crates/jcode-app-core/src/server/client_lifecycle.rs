@@ -1819,6 +1819,25 @@ pub(super) async fn handle_client(
                     .await;
             }
 
+            Request::AcpCallbackResponse { id, result, error } => {
+                // A client's answer to a ServerEvent::AcpCallbackRequest
+                // the daemon sent it (Phase 3, ACP client-callback
+                // plumbing) -- routes to whichever `send_acp_callback` call
+                // is waiting on this id. No client_event_tx reply of our
+                // own: this Request carries no meaningful ack the client
+                // would ever look at, and the whole point of the id-keyed
+                // pending map is that the *waiter* is what needs the
+                // result, not this dispatch site.
+                let outcome = match (result, error) {
+                    (Some(result), _) => Ok(result),
+                    (None, Some(error)) => Err(error),
+                    (None, None) => Err(serde_json::json!({
+                        "message": "client sent neither result nor error"
+                    })),
+                };
+                super::acp_callback::resolve_acp_callback(id, outcome);
+            }
+
             Request::SetReasoningEffort {
                 id,
                 effort,

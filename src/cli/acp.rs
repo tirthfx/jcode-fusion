@@ -1115,6 +1115,60 @@ impl AcpRuntime {
                 ServerEvent::Interrupted => {
                     stop_reason = "cancelled".to_string();
                 }
+                ServerEvent::AcpCallbackRequest { id, method, params } => {
+                    // The daemon's own half of client-callback delegation
+                    // (Phase 3, `server/acp_callback.rs::send_acp_callback`)
+                    // -- deliberately not yet called from anywhere real
+                    // (WriteTool/ReadTool still do their I/O in-process,
+                    // unconditionally), but this side of the relay is real
+                    // and complete: forward it to this adapter's own ACP
+                    // host via the already-built `send_client_request`, and
+                    // report the answer back to the daemon.
+                    //
+                    // Gemini review, 2026-08-30, real bug caught before
+                    // shipping: awaiting `send_client_request` directly in
+                    // this loop (up to a 120s timeout, since
+                    // `session/request_permission` may genuinely involve a
+                    // human clicking a button in their editor) would block
+                    // this same loop from calling `session.read_event()`
+                    // again for that whole window -- meaning a
+                    // simultaneous cancellation, streaming text, or another
+                    // event from the daemon would sit unread until the
+                    // callback resolved. Spawned instead, exactly like
+                    // `handle_session_prompt` already spawns `run_prompt`
+                    // itself for the same "don't block the read loop on a
+                    // slow operation" reason -- `self` is already `Clone`
+                    // and `session` already an `Arc`, so nothing here needs
+                    // to borrow from this loop's own local state.
+                    let runtime = self.clone();
+                    let session_for_callback = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let outcome = runtime
+                            .send_client_request(
+                                &method,
+                                params,
+                                std::time::Duration::from_secs(120),
+                            )
+                            .await;
+                        let response = match outcome {
+                            Ok(result) => Request::AcpCallbackResponse {
+                                id,
+                                result: Some(result),
+                                error: None,
+                            },
+                            Err(err) => Request::AcpCallbackResponse {
+                                id,
+                                result: None,
+                                error: Some(json!({ "message": err.to_string() })),
+                            },
+                        };
+                        if let Err(err) = session_for_callback.send(&response).await {
+                            crate::logging::warn(&format!(
+                                "failed to send AcpCallbackResponse for '{method}': {err:#}"
+                            ));
+                        }
+                    });
+                }
                 ServerEvent::Error { id, message, .. } if id == prompt_id => {
                     cleanup_prompt_state(&session).await;
                     self.write_error_value(rpc_id, JSONRPC_SERVER_ERROR, message)
@@ -1374,10 +1428,14 @@ impl AcpRuntime {
     /// etc.), all pre-existing. A real fix means timing out writes
     /// file-wide, a larger, separate change -- not narrowly special-cased
     /// for just this one caller.
-    #[allow(
-        dead_code,
-        reason = "no real caller yet by design this slice -- exercised directly by this module's own tests; wiring an actual fs/permission/terminal callback through it is deliberately separate follow-up work, see PROGRESS.md"
-    )]
+    ///
+    /// **Now has a real caller**: `run_prompt`'s event loop, relaying a
+    /// `ServerEvent::AcpCallbackRequest` from the daemon (Phase 3, the
+    /// daemon-to-adapter half of client-callback delegation,
+    /// `server/acp_callback.rs`) into a real request to this adapter's own
+    /// ACP host. The daemon side of that relay has no real caller of *its
+    /// own* yet (nothing in `WriteTool`/`ReadTool` invokes it) -- see
+    /// `PROGRESS.md` for that remaining piece.
     async fn send_client_request(
         &self,
         method: &str,
@@ -1904,10 +1962,6 @@ fn required_session_id(params: &Value) -> std::result::Result<String, String> {
 
 /// Build the JSON-RPC request `send_client_request` writes to the host.
 /// Pure and separate from the actual write so it's testable without stdout.
-#[allow(
-    dead_code,
-    reason = "only called from send_client_request, itself not yet called outside tests -- see that function's own allow"
-)]
 fn build_client_request(id: u64, method: &str, params: Value) -> Value {
     json!({
         "jsonrpc": "2.0",

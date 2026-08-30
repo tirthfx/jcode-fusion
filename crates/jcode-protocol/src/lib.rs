@@ -601,6 +601,7 @@ impl Request {
             Request::SetSubagentModel { id, .. } => *id,
             Request::RunSubagent { id, .. } => *id,
             Request::McpConnectServer { id, .. } => *id,
+            Request::AcpCallbackResponse { id, .. } => *id,
             Request::SetReasoningEffort { id, .. } => *id,
             Request::SetServiceTier { id, .. } => *id,
             Request::SetTransport { id, .. } => *id,
