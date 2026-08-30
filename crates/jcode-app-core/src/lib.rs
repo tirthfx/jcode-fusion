@@ -35,6 +35,7 @@ pub mod execpolicy;
 pub mod external_auth;
 pub mod guardian;
 pub mod memory_consolidation;
+pub mod memory_consolidator;
 pub mod mission;
 pub mod network_retry;
 pub mod notifications;
