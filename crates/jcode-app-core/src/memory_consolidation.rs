@@ -302,6 +302,159 @@ pub fn lease_status(session_id: &str) -> anyhow::Result<Option<SessionLease>> {
     Ok(store.leases.get(session_id).cloned())
 }
 
+/// Environment variable gating the ambient-runner wiring below, same
+/// opt-in-by-default-off convention every other Fusion feature already
+/// uses (`JCODE_FUSION_SWARM_WORKTREES`, `JCODE_FUSION_SANDBOX`) — this one
+/// makes real sidecar LLM calls and writes to the user's real memory store
+/// automatically in the background, not something to turn on silently for
+/// every existing ambient user.
+const AMBIENT_WIRING_ENV_VAR: &str = "JCODE_FUSION_MEMORY_CONSOLIDATION";
+
+/// How many session ids `candidate_session_ids` considers per call.
+/// Deliberately small: this runs once per ambient cycle (typically minutes
+/// apart), and only one session actually gets claimed+extracted per cycle
+/// (see `run_one_ambient_extraction`) — the "ambient garden" is meant to
+/// tend gradually, not burst through a whole session store at once. A
+/// larger batch mostly just gives `claim_next_eligible` more already-
+/// `Extracted` sessions to skip past for free.
+const CANDIDATE_BATCH_SIZE: usize = 25;
+
+pub fn is_ambient_wiring_enabled() -> bool {
+    std::env::var(AMBIENT_WIRING_ENV_VAR)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Cheap, deliberately non-exhaustive listing of session ids that might be
+/// worth trying this cycle — **not** "every session on disk." A long-lived
+/// install's `sessions/` directory can hold 100k+ entries (see
+/// `jcode-base`'s `session/maintenance.rs`, which explicitly profiles an
+/// *unconditional* full walk with a per-entry `stat` as the single largest
+/// CPU cost at TUI startup). This function is deliberately far cheaper than
+/// that: `std::fs::read_dir`'s iterator is lazy, so `.take(limit)` stops
+/// reading further entries once satisfied rather than materializing the
+/// whole directory, and nothing here calls `entry.metadata()` (no stat
+/// syscall per entry at all — just the filename jcode already handed back
+/// as part of the directory read itself).
+/// How far into the directory listing a call may skip before taking its
+/// batch (see the random-skip explanation on [`candidate_session_ids`]
+/// itself). Bounded, not proportional to the real directory size -- this
+/// module has no cheap way to learn that size without the same full-scan
+/// cost it's trying to avoid.
+const CANDIDATE_SKIP_WINDOW: usize = 500;
+
+pub fn candidate_session_ids(limit: usize) -> anyhow::Result<Vec<String>> {
+    let ids = candidate_session_ids_with_skip(limit, random_skip_offset())?;
+    if !ids.is_empty() {
+        return Ok(ids);
+    }
+    // Caught while fixing the stagnation bug below, not shipped blind: a
+    // *fixed* random skip of up to CANDIDATE_SKIP_WINDOW overshoots the end
+    // of the listing far more often than not for any install with fewer
+    // sessions than that window -- almost certainly the common case (a
+    // fresh install, a light user) -- which would otherwise turn "fixed on
+    // the first 25 forever" into "usually finds nothing at all," a
+    // different but equally real regression. An empty skipped read falls
+    // back to an unskipped one in the same call, so a small directory still
+    // gets real candidates every cycle; a large one only takes this path
+    // when the random skip happens to land past the end, not as its normal
+    // behavior.
+    candidate_session_ids_with_skip(limit, 0)
+}
+
+/// A small, dependency-free pseudo-random skip amount, same convention
+/// `swarm_worktree.rs::generate_worker_label` already uses for "cheap,
+/// good-enough randomness without adding a `rand` dependency for one call
+/// site" -- current-time nanoseconds, reduced into range.
+fn random_skip_offset() -> usize {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    (nanos % CANDIDATE_SKIP_WINDOW as u128) as usize
+}
+
+/// Cheap, deliberately non-exhaustive listing of session ids that might be
+/// worth trying this cycle — **not** "every session on disk." A long-lived
+/// install's `sessions/` directory can hold 100k+ entries (see
+/// `jcode-base`'s `session/maintenance.rs`, which explicitly profiles an
+/// *unconditional* full walk with a per-entry `stat` as the single largest
+/// CPU cost at TUI startup). This function is deliberately far cheaper than
+/// that: `std::fs::read_dir`'s iterator is lazy, so `.skip(n).take(limit)`
+/// only walks as many directory entries as needed rather than materializing
+/// the whole directory, and nothing here calls `entry.metadata()` (no stat
+/// syscall per entry at all — just the filename jcode already handed back
+/// as part of the directory read itself).
+///
+/// **Real bug caught and fixed by an agy (Gemini 3.1 Pro) review, not
+/// shipped as originally written**: a plain `.take(limit)` with no skip
+/// would return the *same* leading entries on every single call, since
+/// `read_dir`'s enumeration order is stable across calls on an unchanged
+/// directory. Once those first `limit` sessions were all `Extracted`, every
+/// future ambient cycle would find nothing eligible in that fixed prefix
+/// and silently stop making progress forever — the other 99,975+ sessions
+/// in a large install would simply never get a turn. Fixed with a bounded
+/// random skip before the batch: each call starts from a different (if not
+/// perfectly uniform) point in the listing, so a session store larger than
+/// the skip window still gets churned through over many cycles instead of
+/// permanently stalling on one fixed prefix. **Honest limit, not hidden**:
+/// this doesn't guarantee full, uniform coverage of an install with far
+/// more sessions than `CANDIDATE_SKIP_WINDOW`, only that it can't get
+/// permanently stuck the way the original version did — genuinely uniform
+/// coverage would need either counting the directory first (the same
+/// full-scan cost this function exists to avoid) or a persisted rotating
+/// cursor, neither built here.
+pub fn candidate_session_ids_with_skip(limit: usize, skip: usize) -> anyhow::Result<Vec<String>> {
+    let sessions_dir = crate::storage::jcode_dir()?.join("sessions");
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let ids = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            // Gemini review, 2026-08-30: build the extension/stem check
+            // straight off the bare filename rather than `entry.path()`,
+            // which allocates a full `PathBuf` (joining the parent
+            // directory back on) for every single entry just to discard it
+            // a line later.
+            let file_name = entry.file_name();
+            let name_path = std::path::Path::new(&file_name);
+            if name_path.extension().is_some_and(|ext| ext == "json") {
+                name_path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .skip(skip)
+        .take(limit)
+        .collect();
+    Ok(ids)
+}
+
+/// The actual per-cycle entry point: claim at most one eligible session
+/// from a fresh candidate batch and extract it. Returns `Ok(None)` when
+/// there was nothing eligible to claim this cycle (normal, not an error)
+/// or the wiring is disabled via [`is_ambient_wiring_enabled`]; `Ok(Some(n))`
+/// with the memory count on an extraction; extraction errors are already
+/// recorded via `mark_failed` inside `extract_claimed_session` and are
+/// still surfaced here so the caller can log them.
+pub async fn run_one_ambient_extraction(worker_id: &str) -> anyhow::Result<Option<usize>> {
+    if !is_ambient_wiring_enabled() {
+        return Ok(None);
+    }
+    let candidates = candidate_session_ids(CANDIDATE_BATCH_SIZE)?;
+    let Some(session_id) = claim_next_eligible(&candidates, worker_id, DEFAULT_LEASE_DURATION)?
+    else {
+        return Ok(None);
+    };
+    let count = extract_claimed_session(&session_id).await?;
+    Ok(Some(count))
+}
+
 /// Run a real extraction pass on a session this worker already holds the
 /// lease for (via [`claim_next_eligible`]), reporting the outcome back to
 /// the leasing primitive itself -- callers don't need to separately call
@@ -650,5 +803,183 @@ mod tests {
             .expect("status")
             .expect("exists");
         assert_eq!(lease.status, LeaseStatus::Extracted);
+    }
+
+    // --- candidate_session_ids / ambient wiring ---
+
+    fn sessions_dir_for_test() -> std::path::PathBuf {
+        let dir = crate::storage::jcode_dir().expect("jcode dir").join("sessions");
+        std::fs::create_dir_all(&dir).expect("mkdir sessions");
+        dir
+    }
+
+    #[test]
+    fn candidate_session_ids_lists_json_session_files() {
+        with_isolated_home(|| {
+            let dir = sessions_dir_for_test();
+            std::fs::write(dir.join("session-a.json"), "{}").expect("write");
+            std::fs::write(dir.join("session-b.json"), "{}").expect("write");
+
+            let mut ids = candidate_session_ids(10).expect("list");
+            ids.sort();
+            assert_eq!(ids, vec!["session-a".to_string(), "session-b".to_string()]);
+        });
+    }
+
+    #[test]
+    fn candidate_session_ids_ignores_non_json_files() {
+        with_isolated_home(|| {
+            let dir = sessions_dir_for_test();
+            std::fs::write(dir.join("session-a.json"), "{}").expect("write");
+            std::fs::write(dir.join("session-a.bak"), "{}").expect("write");
+            std::fs::write(dir.join("sessions-bak-prune.stamp"), "").expect("write");
+
+            let ids = candidate_session_ids(10).expect("list");
+            assert_eq!(ids, vec!["session-a".to_string()]);
+        });
+    }
+
+    #[test]
+    fn candidate_session_ids_respects_the_limit() {
+        with_isolated_home(|| {
+            let dir = sessions_dir_for_test();
+            for i in 0..10 {
+                std::fs::write(dir.join(format!("session-{i}.json")), "{}").expect("write");
+            }
+            let ids = candidate_session_ids(3).expect("list");
+            assert_eq!(ids.len(), 3, "must stop at the limit, not return all 10");
+        });
+    }
+
+    #[test]
+    fn candidate_session_ids_returns_empty_when_sessions_dir_is_missing() {
+        with_isolated_home(|| {
+            // Deliberately not calling sessions_dir_for_test() -- the
+            // directory itself doesn't exist yet in a fresh JCODE_HOME.
+            let ids = candidate_session_ids(10).expect("must not error");
+            assert!(ids.is_empty());
+        });
+    }
+
+    #[test]
+    fn candidate_session_ids_with_skip_stops_returning_the_same_fixed_prefix() {
+        // Regression for the real stagnation bug an agy review caught: a
+        // plain `.take(limit)` with no variation would return the exact
+        // same leading entries on every call. Two different skip values
+        // over the same 10-entry directory must be able to select
+        // different windows (not required to be *disjoint*, just capable
+        // of differing) -- proving the skip parameter actually changes
+        // which entries come back, not just accepted-but-ignored.
+        with_isolated_home(|| {
+            let dir = sessions_dir_for_test();
+            for i in 0..10 {
+                std::fs::write(dir.join(format!("session-{i}.json")), "{}").expect("write");
+            }
+            let first_window = candidate_session_ids_with_skip(3, 0).expect("list");
+            let later_window = candidate_session_ids_with_skip(3, 5).expect("list");
+            assert_ne!(
+                first_window, later_window,
+                "a nonzero skip must actually shift which entries are returned"
+            );
+        });
+    }
+
+    #[test]
+    fn candidate_session_ids_falls_back_to_unskipped_when_the_random_skip_overshoots() {
+        // Regression for a second bug caught while fixing the first one:
+        // a *fixed* random skip window (up to CANDIDATE_SKIP_WINDOW) lands
+        // past the end of a small directory far more often than not --
+        // almost certainly the common case (a light user, a fresh
+        // install). Without a fallback, that would silently turn "always
+        // stuck on the same 25" into "usually finds nothing at all,"
+        // starving the common case instead of the large-install case.
+        with_isolated_home(|| {
+            let dir = sessions_dir_for_test();
+            std::fs::write(dir.join("only-session.json"), "{}").expect("write");
+
+            // The public entry point applies its own random skip
+            // internally, which for a single-entry directory overshoots on
+            // every call except the rare exact-zero roll -- across many
+            // calls, it must still reliably fall back to real candidates
+            // rather than returning empty most of the time.
+            for _ in 0..20 {
+                let ids = candidate_session_ids(10).expect("list");
+                assert_eq!(ids, vec!["only-session".to_string()]);
+            }
+        });
+    }
+
+    #[test]
+    fn is_ambient_wiring_enabled_is_off_by_default() {
+        let _guard = crate::storage::lock_test_env();
+        crate::env::remove_var(AMBIENT_WIRING_ENV_VAR);
+        assert!(!is_ambient_wiring_enabled());
+    }
+
+    #[test]
+    fn is_ambient_wiring_enabled_reflects_the_env_var() {
+        let _guard = crate::storage::lock_test_env();
+        crate::env::set_var(AMBIENT_WIRING_ENV_VAR, "1");
+        assert!(is_ambient_wiring_enabled());
+        crate::env::remove_var(AMBIENT_WIRING_ENV_VAR);
+    }
+
+    #[tokio::test]
+    async fn run_one_ambient_extraction_is_a_noop_when_wiring_is_disabled() {
+        let _guard = crate::storage::lock_test_env();
+        crate::env::remove_var(AMBIENT_WIRING_ENV_VAR);
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+
+        // Even with an eligible session sitting right there, disabled means
+        // disabled -- must not touch it at all.
+        seeded_session("untouched", 6);
+
+        let result = run_one_ambient_extraction("ambient-test")
+            .await
+            .expect("must not error when disabled");
+        assert_eq!(result, None);
+        assert!(
+            lease_status("untouched").expect("status").is_none(),
+            "a disabled wiring pass must not create a lease for anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_ambient_extraction_claims_and_extracts_when_enabled() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        crate::env::set_var(AMBIENT_WIRING_ENV_VAR, "1");
+
+        seeded_session("ready-for-extraction", 6);
+
+        let result = run_one_ambient_extraction("ambient-test").await;
+        crate::env::remove_var(AMBIENT_WIRING_ENV_VAR);
+        let count = result.expect("must succeed with no LLM backend configured");
+        assert_eq!(
+            count,
+            Some(0),
+            "no backend available in the test environment -- extract_from_transcript's own graceful no-op"
+        );
+
+        let lease = lease_status("ready-for-extraction")
+            .expect("status")
+            .expect("a claim must have happened");
+        assert_eq!(lease.status, LeaseStatus::Extracted);
+    }
+
+    #[tokio::test]
+    async fn run_one_ambient_extraction_returns_none_when_nothing_is_eligible() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        crate::env::set_var(AMBIENT_WIRING_ENV_VAR, "1");
+
+        // No sessions/ directory at all -- candidate_session_ids returns
+        // empty, so there's nothing for claim_next_eligible to pick.
+        let result = run_one_ambient_extraction("ambient-test").await;
+        crate::env::remove_var(AMBIENT_WIRING_ENV_VAR);
+        assert_eq!(result.expect("must not error"), None);
     }
 }

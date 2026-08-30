@@ -773,7 +773,19 @@ impl AmbientRunnerHandle {
                     // Send notifications (fire-and-forget)
                     self.inner.notifier.dispatch_cycle_summary(&transcript);
 
-                    // Post-cycle memory consolidation (fire-and-forget)
+                    // Post-cycle memory consolidation (fire-and-forget).
+                    // Gemini review, 2026-08-30: the embedding backfill and
+                    // the Fusion extraction pass below used to be two
+                    // independent `tokio::spawn` calls -- both touch
+                    // `MemoryManager`'s own storage, so running them
+                    // genuinely concurrently risked avoidable contention on
+                    // top of whatever concurrent-write safety that storage
+                    // layer does or doesn't already have on its own (a
+                    // pre-existing property of `MemoryManager`, not
+                    // something this fixes broadly). Sequenced into one
+                    // task instead -- removes the *new* overlap this wiring
+                    // would otherwise have introduced, without claiming to
+                    // solve concurrent memory-storage access in general.
                     tokio::spawn(async move {
                         let manager = MemoryManager::new();
                         match manager.backfill_embeddings() {
@@ -789,6 +801,44 @@ impl AmbientRunnerHandle {
                                 logging::error(&format!(
                                     "Ambient: embedding backfill failed: {}",
                                     e
+                                ));
+                            }
+                        }
+
+                        // Fusion Phase 4: memory consolidation (DESIGN.md
+                        // item #9) -- claim and extract at most one
+                        // eligible session per cycle, after the backfill
+                        // above completes (not concurrently with it).
+                        // Opt-in (`JCODE_FUSION_MEMORY_CONSOLIDATION=1`,
+                        // default off, checked inside
+                        // `run_one_ambient_extraction` itself) -- this
+                        // makes real sidecar LLM calls and writes to the
+                        // user's memory store, not something to turn on
+                        // silently for every existing ambient user.
+                        //
+                        // **Known gap, not fixed here**: this leasing
+                        // store's own `Extracted` state is entirely
+                        // separate from `Agent::extract_session_memories`'s
+                        // (the interactive-CLI-exit path's own extraction
+                        // trigger, unchanged) -- the two don't share
+                        // completion tracking. A session could genuinely be
+                        // extracted once by each trigger, redundantly.
+                        // Unifying them means also touching that
+                        // already-shipped call site, a separate, larger
+                        // change than this slice's scope.
+                        match crate::memory_consolidation::run_one_ambient_extraction("ambient")
+                            .await
+                        {
+                            Ok(Some(count)) if count > 0 => {
+                                logging::info(&format!(
+                                    "Ambient: extracted {count} memor{} from a background session",
+                                    if count == 1 { "y" } else { "ies" }
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                logging::error(&format!(
+                                    "Ambient: memory consolidation pass failed: {e}"
                                 ));
                             }
                         }
