@@ -54,6 +54,15 @@ struct JsonRpcMessage {
     id: Option<Value>,
     method: Option<String>,
     params: Value,
+    /// Present only on a *response* to a request this adapter itself sent
+    /// to the ACP host (Phase 3, client-callback plumbing) -- a real ACP
+    /// *request* from the host always has `method` set instead. Previously
+    /// dropped entirely by this parser, which is exactly why
+    /// `handle_message` used to treat every response as a malformed
+    /// request ("missing method").
+    result: Option<Value>,
+    #[allow(dead_code)] // read by route_response; kept for parity with `result`, not yet surfaced elsewhere
+    error: Option<Value>,
 }
 
 impl JsonRpcMessage {
@@ -79,7 +88,15 @@ impl JsonRpcMessage {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             params: object.get("params").cloned().unwrap_or(Value::Null),
+            result: object.get("result").cloned(),
+            error: object.get("error").cloned(),
         })
+    }
+
+    /// True if this message is shaped like a JSON-RPC *response* (has
+    /// `result` or `error`, not `method`) rather than a request/notification.
+    fn is_response(&self) -> bool {
+        self.method.is_none() && (self.result.is_some() || self.error.is_some())
     }
 }
 
@@ -244,6 +261,40 @@ impl DaemonSession {
     }
 }
 
+/// One outbound request this adapter sent to the ACP *host* (not the jcode
+/// daemon -- see `DaemonSession` for that direction), still awaiting a
+/// response. `Ok`/`Err` mirror the JSON-RPC `result`/`error` fields the
+/// eventual response line will carry.
+type PendingClientRequests = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<std::result::Result<Value, Value>>>>>;
+
+/// Removes `id` from `pending` when dropped, however `send_client_request`'s
+/// scope ends -- normal completion, an early `?`-return, or the caller
+/// cancelling the whole `Future` (e.g. racing it in a `tokio::select!`).
+/// Gemini review, 2026-08-30: without this, a cancelled call leaked its
+/// entry forever, since neither the timeout arm nor `handle_message`'s
+/// response routing (the two other cleanup paths) ever get to run for a
+/// future that was simply dropped mid-await.
+///
+/// Uses `try_lock` (synchronous -- `Drop::drop` can't be `async`) on
+/// `tokio::sync::Mutex`, which supports it directly. Best-effort: if the
+/// lock is contested at the exact moment of drop (another task is
+/// concurrently completing this same id via `handle_message`, which is
+/// itself harmless -- that path already removes the entry), this simply
+/// does nothing rather than blocking a destructor, which is the correct
+/// tradeoff since the entry is either already gone or about to be.
+struct PendingRequestGuard {
+    pending: PendingClientRequests,
+    id: u64,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.try_lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AcpRuntime {
     stdout: Arc<Mutex<tokio::io::Stdout>>,
@@ -252,6 +303,14 @@ struct AcpRuntime {
     provider_choice: ProviderChoice,
     model: Option<String>,
     provider_profile: Option<String>,
+    /// Phase 3, ACP client-callback plumbing: lets this adapter send a
+    /// request *to* the ACP host (`fs/read_text_file` etc., not yet wired
+    /// to any real caller in this slice) and correlate the eventual
+    /// response back to the right waiter. Own id space (`next_client_request_id`),
+    /// separate from `DaemonSession`'s own ids -- these two directions
+    /// (adapter->host, adapter->daemon) never share a wire.
+    pending_client_requests: PendingClientRequests,
+    next_client_request_id: Arc<AtomicU64>,
 }
 
 impl AcpRuntime {
@@ -268,6 +327,8 @@ impl AcpRuntime {
             provider_choice,
             model,
             provider_profile,
+            pending_client_requests: Arc::new(Mutex::new(HashMap::new())),
+            next_client_request_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -304,6 +365,27 @@ impl AcpRuntime {
     }
 
     async fn handle_message(&self, message: JsonRpcMessage) -> Result<()> {
+        // No `method` means this is either a response to a request *we*
+        // sent the host (`send_client_request`), or genuinely malformed.
+        // Checked as its own branch, *before* the method match below --
+        // Gemini review, 2026-08-30: a response whose id this adapter
+        // didn't recognize (e.g. a non-integer id) previously still fell
+        // through to "JSON-RPC request missing method", a real reply sent
+        // back to the host for something that was never a request at all.
+        // Now anything response-shaped is fully handled here -- routed if
+        // there's a waiter, silently dropped otherwise (see
+        // `route_response`'s own doc) -- and never reaches the error path
+        // below, regardless of whether routing actually found a match.
+        if message.is_response() {
+            if let Some((id, payload)) = route_response(message) {
+                let waiter = self.pending_client_requests.lock().await.remove(&id);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(payload);
+                }
+            }
+            return Ok(());
+        }
+
         let Some(method) = message.method.as_deref() else {
             if let Some(id) = message.id {
                 self.write_error_value(
@@ -1264,6 +1346,80 @@ impl AcpRuntime {
         .await
     }
 
+    /// Send a request *to the ACP host* (not the jcode daemon) and await
+    /// its response -- the plumbing Phase 3's client-callback delegation
+    /// (`fs/read_text_file`, `session/request_permission`, `terminal/*`)
+    /// needs, built here as its own isolated, tested slice with **no real
+    /// caller wired up yet** (deliberately -- see `PROGRESS.md`'s scoping
+    /// note on why the actual `WriteTool`/`ReadTool` delegation is a
+    /// separate, larger slice: those tools run in the daemon process, a
+    /// different process from this adapter).
+    ///
+    /// Safe to call while other messages are being handled: `run()`'s main
+    /// read loop already spawns long-running handlers (`handle_session_prompt`
+    /// spawns `run_prompt`) rather than blocking on them, precisely so it
+    /// stays free to read the next line -- including this request's
+    /// eventual response -- while a caller awaits this method. Times out
+    /// after `timeout` rather than hanging forever if the host never
+    /// replies, the same "don't trust an external party to always answer"
+    /// discipline the daemon-side MCP-connect timeout already applies in
+    /// the other direction (`create_new_session`).
+    ///
+    /// **Known gap, not fixed here (Gemini review, 2026-08-30)**: `timeout`
+    /// only wraps waiting for the response, not the initial `write_value`
+    /// call below -- if the host stops reading its stdin entirely (pipe
+    /// buffer fills), that write could itself block past `timeout`. Not
+    /// specific to this function: every `write_value` call anywhere in this
+    /// file has the same exposure (`write_result`, `write_notification`,
+    /// etc.), all pre-existing. A real fix means timing out writes
+    /// file-wide, a larger, separate change -- not narrowly special-cased
+    /// for just this one caller.
+    #[allow(
+        dead_code,
+        reason = "no real caller yet by design this slice -- exercised directly by this module's own tests; wiring an actual fs/permission/terminal callback through it is deliberately separate follow-up work, see PROGRESS.md"
+    )]
+    async fn send_client_request(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        let id = self.next_client_request_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.pending_client_requests.lock().await;
+            pending.insert(id, tx);
+        }
+        // Gemini review, 2026-08-30: without this, a caller that drops this
+        // method's own `Future` before it resolves (e.g. racing it inside
+        // an outer `tokio::select!` or an unrelated cancellation) would
+        // leak this entry forever -- neither the timeout branch below nor
+        // `handle_message`'s response-routing would ever run to clean it
+        // up, since the future doing that cleanup is exactly what got
+        // dropped. The guard's `Drop` runs regardless of *how* this
+        // function's scope ends, cancellation included.
+        let _cleanup_guard = PendingRequestGuard {
+            pending: self.pending_client_requests.clone(),
+            id,
+        };
+
+        self.write_value(build_client_request(id, method, params))
+            .await?;
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(error))) => Err(anyhow::anyhow!(
+                "ACP host returned an error for '{method}': {error}"
+            )),
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "internal: pending request for '{method}' (id {id}) was dropped without a response"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "ACP host did not respond to '{method}' within {timeout:?}"
+            )),
+        }
+    }
+
     async fn write_jcode_extension_event(
         &self,
         session_id: &str,
@@ -1744,6 +1900,49 @@ fn required_session_id(params: &Value) -> std::result::Result<String, String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "Missing required sessionId".to_string())
+}
+
+/// Build the JSON-RPC request `send_client_request` writes to the host.
+/// Pure and separate from the actual write so it's testable without stdout.
+#[allow(
+    dead_code,
+    reason = "only called from send_client_request, itself not yet called outside tests -- see that function's own allow"
+)]
+fn build_client_request(id: u64, method: &str, params: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+/// If `message` is response-shaped (see [`JsonRpcMessage::is_response`])
+/// and its `id` is a plain non-negative integer (the only kind
+/// [`build_client_request`] ever sends), return the id and the
+/// `Ok(result)`/`Err(error)` payload to route to a pending waiter.
+/// Anything else (a real request/notification, or a response whose id
+/// this adapter couldn't have generated) returns `None` -- not an error,
+/// since an unrecognized response id is the host's problem, not this
+/// adapter's, and is deliberately just ignored by the caller rather than
+/// breaking the connection over it.
+/// Takes `message` by value rather than borrowing (Gemini review,
+/// 2026-08-30): `result`/`error` used to be cloned out of a `&JsonRpcMessage`
+/// -- harmless for a small ack, but `fs/read_text_file`'s own result is
+/// exactly the kind of payload (a whole file's contents) where that clone
+/// stops being free. `handle_message` already owns `message` outright and
+/// has nothing left to do with it after this call, so moving the fields out
+/// is free.
+fn route_response(message: JsonRpcMessage) -> Option<(u64, std::result::Result<Value, Value>)> {
+    if !message.is_response() {
+        return None;
+    }
+    let id = message.id?.as_u64()?;
+    match (message.result, message.error) {
+        (Some(result), _) => Some((id, Ok(result))),
+        (None, Some(error)) => Some((id, Err(error))),
+        (None, None) => None,
+    }
 }
 
 fn validate_acp_mcp_servers(params: &Value) -> std::result::Result<(), String> {
@@ -2372,5 +2571,171 @@ mod tests {
             state.context_limit(),
             crate::provider::DEFAULT_CONTEXT_LIMIT as u64
         );
+    }
+
+    // --- Phase 3: ACP client-callback plumbing (send_client_request /
+    // route_response) -- the mechanism only, no real caller wired up yet. ---
+
+    fn test_runtime() -> AcpRuntime {
+        AcpRuntime::new(AcpProfile::Standard, ProviderChoice::Jcode, None, None)
+    }
+
+    #[test]
+    fn build_client_request_shapes_a_valid_jsonrpc_request() {
+        let request = build_client_request(7, "fs/read_text_file", json!({"path": "/tmp/x"}));
+        assert_eq!(request["jsonrpc"], "2.0");
+        assert_eq!(request["id"], 7);
+        assert_eq!(request["method"], "fs/read_text_file");
+        assert_eq!(request["params"]["path"], "/tmp/x");
+    }
+
+    #[test]
+    fn route_response_extracts_a_result() {
+        let message =
+            JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":3,"result":{"content":"hi"}}"#)
+                .expect("parse");
+        let (id, payload) = route_response(message).expect("should route");
+        assert_eq!(id, 3);
+        assert_eq!(payload, Ok(json!({"content": "hi"})));
+    }
+
+    #[test]
+    fn route_response_extracts_an_error() {
+        let message =
+            JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":3,"error":{"code":-1,"message":"nope"}}"#)
+                .expect("parse");
+        let (id, payload) = route_response(message).expect("should route");
+        assert_eq!(id, 3);
+        assert_eq!(payload, Err(json!({"code": -1, "message": "nope"})));
+    }
+
+    #[test]
+    fn route_response_ignores_a_real_request() {
+        let message = JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .expect("parse");
+        assert!(route_response(message).is_none());
+    }
+
+    #[test]
+    fn route_response_ignores_a_response_with_a_non_integer_id() {
+        // This adapter only ever generates plain u64 ids for its own
+        // outbound requests (build_client_request) -- a response whose id
+        // is a string or float couldn't be one of ours.
+        let message =
+            JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":"acp-host-id","result":{}}"#)
+                .expect("parse");
+        assert!(route_response(message).is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_message_routes_a_response_to_the_pending_waiter() {
+        let runtime = test_runtime();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        runtime.pending_client_requests.lock().await.insert(42, tx);
+
+        let response =
+            JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":42,"result":{"ok":true}}"#)
+                .expect("parse");
+        runtime.handle_message(response).await.expect("handle_message");
+
+        let payload = rx.await.expect("waiter should have been completed");
+        assert_eq!(payload, Ok(json!({"ok": true})));
+        assert!(
+            !runtime.pending_client_requests.lock().await.contains_key(&42),
+            "the pending entry must be removed once routed"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_silently_drops_a_response_with_no_matching_waiter() {
+        let runtime = test_runtime();
+        // Nothing registered for id 99 -- e.g. it already timed out, or
+        // this is a stray response. Must not error the connection.
+        let response = JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":99,"result":{}}"#)
+            .expect("parse");
+        runtime
+            .handle_message(response)
+            .await
+            .expect("must not error on an unmatched response");
+    }
+
+    #[tokio::test]
+    async fn handle_message_does_not_treat_a_non_integer_id_response_as_a_bad_request() {
+        // Regression for a real bug (Gemini review, 2026-08-30): this is
+        // response-shaped (no method, has result) but its id isn't one
+        // this adapter could have generated (route_response returns None
+        // for it) -- previously fell through to sending back "JSON-RPC
+        // request missing method", a spurious reply for something that was
+        // never a request. `handle_message.is_response()` is now checked
+        // as its own branch *before* that fallback, so this path is now
+        // structurally unreachable for anything response-shaped, matched
+        // or not. (Asserting *what* got written to stdout isn't checkable
+        // here -- `AcpRuntime.stdout` is a real `tokio::io::Stdout`, not an
+        // injectable sink -- so this only proves the call still succeeds
+        // cleanly with no panic/error propagated, same as the matched
+        // case above; the "no error line sent" property is verified by
+        // code inspection of the `if message.is_response() { ...; return
+        // Ok(()); }` early-return, not by this test alone.)
+        let runtime = test_runtime();
+        let response =
+            JsonRpcMessage::parse(r#"{"jsonrpc":"2.0","id":"acp-host-id","result":{}}"#)
+                .expect("parse");
+        runtime
+            .handle_message(response)
+            .await
+            .expect("must not error on a response with an unrecognized id shape");
+    }
+
+    #[tokio::test]
+    async fn send_client_request_times_out_cleanly_when_the_host_never_responds() {
+        let runtime = test_runtime();
+        let result = runtime
+            .send_client_request(
+                "fs/read_text_file",
+                json!({"path": "/tmp/x"}),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert!(result.is_err(), "must time out, not hang forever");
+        assert!(
+            runtime.pending_client_requests.lock().await.is_empty(),
+            "a timed-out request must clean up its own pending-map entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_client_request_resolves_when_the_matching_response_arrives() {
+        let runtime = test_runtime();
+        let runtime_for_send = runtime.clone();
+        let send_task = tokio::spawn(async move {
+            runtime_for_send
+                .send_client_request(
+                    "fs/read_text_file",
+                    json!({"path": "/tmp/x"}),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+
+        // Poll until send_client_request has registered its waiter --
+        // deterministic (bounded retries on a real condition), not a fixed
+        // sleep guessing how long registration takes.
+        let id = loop {
+            let pending = runtime.pending_client_requests.lock().await;
+            if let Some((&id, _)) = pending.iter().next() {
+                break id;
+            }
+            drop(pending);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+
+        let response = JsonRpcMessage::parse(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":"file contents"}}}}"#
+        ))
+        .expect("parse");
+        runtime.handle_message(response).await.expect("handle_message");
+
+        let result = send_task.await.expect("task").expect("should resolve");
+        assert_eq!(result, json!({"content": "file contents"}));
     }
 }
