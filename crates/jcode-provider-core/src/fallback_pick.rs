@@ -42,6 +42,19 @@ pub struct FallbackPickOptions {
     /// - when the failed api_method is unknown, all same-provider routes are
     ///   excluded because any of them could share the broken credential.
     pub credential_failure: bool,
+    /// The failure looks like a rate limit or quota exhaustion (HTTP 429,
+    /// `RESOURCE_EXHAUSTED`, "too many requests", ...) rather than a
+    /// per-model problem. **Real bug, found via a live debugging session,
+    /// not theorized**: a provider-wide rate limit (e.g. an account-level
+    /// quota gate on one specific backend) affects every model on that
+    /// provider identically -- so ranking "same provider, different model"
+    /// (tier 1) ahead of "different provider" (tier 2) meant a rate-limited
+    /// provider kept getting re-offered as its own fallback, model after
+    /// model, cycling through every sibling on the same broken backend
+    /// before ever reaching a provider that might actually work. Treated
+    /// exactly like [`Self::credential_failure`]: widens the exclusion to
+    /// the whole same-provider tier, not just the one model that failed.
+    pub rate_limited: bool,
 }
 
 /// Whether `error` looks like a credential/auth failure for the active route's
@@ -69,6 +82,28 @@ pub fn error_looks_like_credential_failure(error: &str) -> bool {
         "credentials have been revoked",
         "please log in again",
         "run /login",
+    ];
+    markers.iter().any(|marker| lower.contains(marker))
+}
+
+/// Whether `error` looks like a rate limit or quota exhaustion for the active
+/// route's provider (HTTP 429, `RESOURCE_EXHAUSTED`, "too many requests",
+/// "quota"), as opposed to a credential problem or a one-off transient
+/// failure. Deliberately does *not* overlap with
+/// [`error_looks_like_credential_failure`]'s own markers -- a 429 is not an
+/// auth failure, it gets its own classification and its own (identical)
+/// exclusion-widening treatment in [`FallbackPickOptions::rate_limited`].
+pub fn error_looks_like_rate_limit_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let markers = [
+        "429",
+        "resource_exhausted",
+        "resource has been exhausted",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "quota exceeded",
+        "quota has been exhausted",
     ];
     markers.iter().any(|marker| lower.contains(marker))
 }
@@ -135,9 +170,17 @@ pub fn pick_next_fallback_route_with_options(
             }
 
             // A credential failure breaks every route that authenticates with
-            // the same credential, not just the failed model. Skip them all so
-            // the offer is a route that can plausibly work.
-            if options.credential_failure && same_provider && (same_method || unknown_method) {
+            // the same credential, not just the failed model. A provider-wide
+            // rate limit/quota exhaustion is the same shape of problem --
+            // every model behind that provider's gate is equally blocked, not
+            // just the one that happened to fail first. Skip them all in
+            // either case so the offer is a route that can plausibly work,
+            // rather than cycling through same-provider siblings that will
+            // fail identically.
+            if (options.credential_failure || options.rate_limited)
+                && same_provider
+                && (same_method || unknown_method)
+            {
                 return None;
             }
 
@@ -278,6 +321,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limited: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -300,6 +344,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limited: false,
         };
         let pick = pick_next_fallback_route_with_options(
             &routes,
@@ -324,6 +369,7 @@ mod tests {
         ];
         let options = FallbackPickOptions {
             credential_failure: true,
+            rate_limited: false,
         };
         let pick = pick_next_fallback_route_with_options(&routes, "gpt-5.5", "OpenAI", "", options)
             .expect("a fallback should exist");
@@ -358,5 +404,84 @@ mod tests {
         assert!(!error_looks_like_credential_failure(
             "500 internal server error"
         ));
+    }
+
+    #[test]
+    fn classifies_rate_limit_failures() {
+        // The exact real-world shape this regression is for: Antigravity's
+        // own generateContent 429, reproduced live.
+        assert!(error_looks_like_rate_limit_failure(
+            "Antigravity generateContent failed after 4 attempt(s) with HTTP 429 \
+             RESOURCE_EXHAUSTED: {\"error\": {\"code\": 429, \"message\": \"Resource has been \
+             exhausted (e.g. check quota).\", \"status\": \"RESOURCE_EXHAUSTED\"}}"
+        ));
+        assert!(error_looks_like_rate_limit_failure(
+            "429 rate limit exceeded, retry after 30s"
+        ));
+        assert!(error_looks_like_rate_limit_failure("too many requests"));
+        assert!(error_looks_like_rate_limit_failure("quota exceeded for this project"));
+        // Must not overlap with credential-failure markers -- a 429 is not an
+        // auth problem, and vice versa.
+        assert!(!error_looks_like_rate_limit_failure(
+            "OpenAI token refresh failed; run /login to re-authenticate: refresh_token_invalidated"
+        ));
+        assert!(!error_looks_like_rate_limit_failure(
+            "500 internal server error"
+        ));
+    }
+
+    #[test]
+    fn rate_limited_skips_same_provider_siblings_like_credential_failure_does() {
+        // Regression for a real bug found via a live debugging session: an
+        // Antigravity model rate-limited by a provider-wide 429 was being
+        // offered ANOTHER Antigravity model as its own "fallback" (tier 1,
+        // same provider) -- ranked *ahead* of a genuinely different, working
+        // provider (tier 2) -- because rate limits weren't classified as a
+        // provider-wide failure the way credential failures already were.
+        // This proves the fix: a rate-limited provider is skipped entirely,
+        // just like a provider with a broken credential.
+        let routes = vec![
+            route("gemini-3.1-pro-high", "Antigravity", "https", true),
+            route("claude-opus-4-6-thinking", "Antigravity", "https", true),
+            route("claude-sonnet-4-6", "Anthropic", "claude-oauth", true),
+        ];
+        let options = FallbackPickOptions {
+            credential_failure: false,
+            rate_limited: true,
+        };
+        let pick = pick_next_fallback_route_with_options(
+            &routes,
+            "gemini-3.1-pro-high",
+            "Antigravity",
+            "https",
+            options,
+        )
+        .expect("a fallback should exist");
+        assert_eq!(
+            routes[pick].provider, "Anthropic",
+            "a rate-limited provider must not offer a sibling model on the same broken backend"
+        );
+    }
+
+    #[test]
+    fn without_rate_limited_still_prefers_same_provider_sibling() {
+        // The other half of "provably a real behavior change, not a
+        // coincidence": with `rate_limited: false` (the pre-fix default),
+        // the exact same routes still rank the same-provider sibling first
+        // -- confirming the new field, not something else, is what changed
+        // the outcome above.
+        let routes = vec![
+            route("gemini-3.1-pro-high", "Antigravity", "https", true),
+            route("claude-opus-4-6-thinking", "Antigravity", "https", true),
+            route("claude-sonnet-4-6", "Anthropic", "claude-oauth", true),
+        ];
+        let pick = pick_next_fallback_route(
+            &routes,
+            "gemini-3.1-pro-high",
+            "Antigravity",
+            "https",
+        )
+        .expect("a fallback should exist");
+        assert_eq!(routes[pick].provider, "Antigravity");
     }
 }

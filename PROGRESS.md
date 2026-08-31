@@ -545,6 +545,20 @@ At the user's explicit request to keep pushing on this ("fix it by any cost"), w
 
 **What does work, confirmed live and repeatedly**: the `claude`/Anthropic OAuth path, end to end, real responses, real token accounting. The project's actual "multiple providers under one roof" architecture is delivered and proven — Antigravity is the one provider blocked by what appears to be a genuine Google-side restriction, not a gap in jcode-fusion's own design or code.
 
+## Real fallback-routing bug found and fixed: rate-limited providers were offering themselves as their own fallback (2026-08-31)
+
+Found via a live debugging session, not a code review: after ruling out any header-based fix for Antigravity's 429 (see the section above), the user kept getting bounced between *different Antigravity models* every time they accepted the app's own "press Ctrl+Y to switch and resend" fallback offer -- never landing on their genuinely working `anthropic(oauth)`/`openai(oauth)` providers, sitting right there authenticated the whole time.
+
+**Root cause, found by reading `crates/jcode-provider-core/src/fallback_pick.rs`'s own ranking logic**: `pick_next_fallback_route`'s tier system ranks "same provider, different model" (tier 1) *ahead of* "different provider" (tier 2) -- a reasonable default (minimize disruption) for a per-model problem, but wrong for a provider-wide one. There was already special-casing for this exact shape of problem -- a credential failure (expired OAuth, broken API key) correctly widens the exclusion to the whole provider, since every route behind a dead credential is equally broken -- but a 429/rate-limit error was never classified that way, so it fell through to the ordinary tiering and kept re-offering Antigravity siblings.
+
+**Fixed**: added `error_looks_like_rate_limit_failure` (matches `429`, `RESOURCE_EXHAUSTED`, `rate limit`, `too many requests`, `quota exceeded` -- deliberately non-overlapping with the credential-failure markers) and a new `FallbackPickOptions::rate_limited` field, given the exact same same-provider-exclusion-widening treatment `credential_failure` already gets. Wired into the one real call site in `model_context.rs`'s `offer_fallback_after_error_with_payload`.
+
+5 new tests: the classifier itself (including the real Antigravity 429 message verbatim), a same-provider-sibling-skipped regression proving the fix, and its own explicit "without the fix, still prefers the sibling" counterpart proving the new field -- not something else -- is what changed the outcome.
+
+**A real pre-existing test-infrastructure issue found while verifying this, not caused by it**: `cargo test -p jcode-tui --lib` with its default parallel scheduling hangs indefinitely partway through (confirmed near-zero CPU on the stuck process, not genuine slowness) -- reproduced identically with this fix's changes fully `git stash`ed out, so it's a pre-existing contention/deadlock class in jcode-tui's own test suite, unrelated to this fix. `--test-threads=1` sidesteps it cleanly: **2183 passed, 29 failed, 18 ignored**, byte-for-byte identical on the baseline and with the fix applied -- zero regressions, confirmed properly despite the parallel-mode hang. Worth a dedicated future session (same category as the already-documented `bash_tests.rs` HOME-env-var flakiness) to find and fix the actual shared-resource contention, not attempted here.
+
+`jcode-provider-core`: all 14 fallback_pick tests pass (11 pre-existing + 3 new). `jcode-base`: 1319 passed, 21 failed -- exact standing baseline. Full binary rebuilds clean, zero new warnings (29, all pre-existing).
+
 ## Next steps (pick up here)
 
 1. **Phase 3, orchestration-as-script**: `save`/`list`/`run` are wired and tested, but `run`'s actual `Request::CommSeedGraph` round trip has never been exercised against a live daemon (same category of gap as every other slice's "no live-credentialed run yet" note) — worth covering once a live verification session happens. No Starlark scripting inside a template yet (reuse the existing dependency, don't add `rhai` — see above). No template versioning/migration story if the shape changes again.

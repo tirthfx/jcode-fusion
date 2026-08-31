@@ -65,9 +65,9 @@ pub use jcode_provider_core::{
     shared_http_client, summarize_model_catalog_refresh,
 };
 pub use jcode_provider_core::{
-    FallbackPickOptions, error_looks_like_credential_failure, model_route_provider_labels_match,
-    normalize_model_route_provider_label, pick_next_fallback_route,
-    pick_next_fallback_route_with_options,
+    FallbackPickOptions, error_looks_like_credential_failure, error_looks_like_rate_limit_failure,
+    model_route_provider_labels_match, normalize_model_route_provider_label,
+    pick_next_fallback_route, pick_next_fallback_route_with_options,
 };
 pub use jcode_provider_core::{ProviderFailoverPrompt, parse_failover_prompt_message};
 pub use route_builders::{
