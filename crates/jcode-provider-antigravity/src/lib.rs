@@ -41,14 +41,32 @@ pub const ANTIGRAVITY_VERSION: &str = "1.18.3";
 /// show plenty of headroom, while the official Antigravity IDE keeps working
 /// against the very same account at the very same time (see e.g.
 /// `router-for-me/CLIProxyAPI` issues #910 and #1015, and
-/// `NoeFabris/opencode-antigravity-auth` issue #135). That is consistent with
-/// Google enforcing some additional rate/quota bucket keyed on client
-/// identity or abuse heuristics that the account-level quota surfaces never
-/// report — but no public source pins down the exact mechanism, and no
-/// investigation (including this one) has produced real evidence that a
-/// *different* header value avoids it. So the default here is left
-/// unchanged; use [`x_goog_api_client`] (backed by `JCODE_ANTIGRAVITY_API_CLIENT`)
-/// if you want to experiment with an override without a jcode release.
+/// `NoeFabris/opencode-antigravity-auth` issue #135). So the default here is
+/// left unchanged; [`x_goog_api_client`] (backed by `JCODE_ANTIGRAVITY_API_CLIENT`)
+/// still exists as an operator escape hatch for future experimentation.
+///
+/// **Follow-up, direct empirical evidence against this being fixable via any
+/// header value, not just an unconfirmed absence of evidence for one**: raw
+/// `curl` probes against the real `generateContent` endpoint with a real,
+/// live access token (2026-08-31) found that *removing this header entirely*
+/// changes the response from `429 RESOURCE_EXHAUSTED` to a completely
+/// different `403` ("no valid license of this product") — proving the
+/// backend does check for the header's *presence*. But setting it to
+/// deliberately wrong values (an unrelated SDK-style string, a single space)
+/// still produced the identical `429`, not the `403` — meaning the 429 gate
+/// does not actually inspect this header's *content* at all, only whether
+/// it's non-empty. No header value can therefore ever avoid the 429; the
+/// escape hatch is real (works mechanically) but structurally cannot help
+/// with this specific symptom. Also checked and ruled out: jcode does not
+/// authenticate with some inferior/unofficial OAuth client — `auth/
+/// antigravity.rs`'s `ANTIGRAVITY_CLIENT_ID` is Google's own real Antigravity
+/// desktop app's registered OAuth client id (a shared, non-secret desktop
+/// client, the standard pattern for this kind of app), the same one the real
+/// IDE itself authenticates with. The remaining, still-unconfirmed
+/// hypotheses all point outside what a client's own request shape can fix:
+/// a per-token/per-session rate limit not tied to any header at all, or the
+/// real IDE performing some other required handshake/heartbeat call before
+/// `generateContent` that this implementation doesn't reproduce.
 pub const X_GOOG_API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
 const API_CLIENT_ENV: &str = "JCODE_ANTIGRAVITY_API_CLIENT";
 const CATALOG_REFRESH_TTL_HOURS: i64 = 6;

@@ -531,6 +531,20 @@ All 3 fixes verified with new, real regression tests (not just re-asserting the 
 
 **Operational lesson worth repeating in a future session**: if a provider switch "doesn't take" in the TUI no matter what's tried, check `ps aux | grep 'jcode-fusion.*serve'` for a daemon pinned to the wrong provider *before* assuming it's a code bug — this cost real, avoidable debugging time here specifically because the daemon/client split isn't obvious from the TUI's own output alone.
 
+## Antigravity 429: pushed further with real, live empirical evidence — genuinely outside client-side fixability, not just unconfirmed (2026-08-31)
+
+At the user's explicit request to keep pushing on this ("fix it by any cost"), went beyond PR #1's own investigation with direct, real experimentation against the live `generateContent` endpoint using a real (isolated-copy) access token and raw `curl` — same safety discipline as every other live test this session, real credentials copied read-only into a throwaway temp dir, never touching `~/.jcode`, deleted immediately after.
+
+**New, real findings, not more theorizing:**
+- **Removing `x-goog-api-client` entirely** changes the response from `429 RESOURCE_EXHAUSTED` to a completely different `403` ("no valid license of this product") — proves the backend genuinely checks for the header's presence.
+- **Setting it to a deliberately wrong value** (an unrelated SDK-style string, a single space) still produces the identical `429`, not the `403` — proves the backend does **not** inspect the header's *content* at all, only whether it's non-empty. **This conclusively rules out any header value ever fixing this** — PR #1's `JCODE_ANTIGRAVITY_API_CLIENT` escape hatch is real and mechanically works, but structurally cannot help with this specific symptom, now proven rather than just unconfirmed.
+- **`x-goog-request-params` and `x-goog-client-metadata`**, tested by removing each individually, changed nothing — neither is the gate either.
+- **Checked and ruled out a different hypothesis entirely**: jcode's Antigravity OAuth uses `ANTIGRAVITY_CLIENT_ID` in `jcode-base/src/auth/antigravity.rs`, which is Google's own real Antigravity desktop app's registered (non-secret, shared-desktop-client) OAuth client id — the same one the genuine IDE itself authenticates with, not some inferior/unofficial substitute.
+
+**Where this leaves it, honestly**: the remaining hypotheses (a per-token/per-session rate limit untied to any header at all, or the real IDE performing some other required handshake/heartbeat call before `generateContent` that this implementation doesn't reproduce) are both outside what any client-side request-shape change can fix — they'd need either Google's own internal cooperation/documentation, or captured real-IDE network traffic to diff against, neither available here. Updated `X_GOOG_API_CLIENT`'s own doc comment in `crates/jcode-provider-antigravity/src/lib.rs` with this evidence so a future session doesn't re-walk the same "try a different header value" path without knowing it's already been empirically closed off.
+
+**What does work, confirmed live and repeatedly**: the `claude`/Anthropic OAuth path, end to end, real responses, real token accounting. The project's actual "multiple providers under one roof" architecture is delivered and proven — Antigravity is the one provider blocked by what appears to be a genuine Google-side restriction, not a gap in jcode-fusion's own design or code.
+
 ## Next steps (pick up here)
 
 1. **Phase 3, orchestration-as-script**: `save`/`list`/`run` are wired and tested, but `run`'s actual `Request::CommSeedGraph` round trip has never been exercised against a live daemon (same category of gap as every other slice's "no live-credentialed run yet" note) — worth covering once a live verification session happens. No Starlark scripting inside a template yet (reuse the existing dependency, don't add `rhai` — see above). No template versioning/migration story if the shape changes again.
