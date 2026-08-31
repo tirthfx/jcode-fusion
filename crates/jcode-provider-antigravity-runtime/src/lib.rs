@@ -10,9 +10,10 @@ use jcode_base::auth::antigravity as antigravity_auth;
 use jcode_message_types::{ConnectionPhase, Message, StreamEvent, ToolDefinition};
 use jcode_provider_antigravity::{
     AVAILABLE_MODELS, CatalogModel, CatalogSnapshot, DEFAULT_FALLBACK_MODEL,
-    GENERATE_CONTENT_API_URL, PersistedCatalog, X_GOOG_API_CLIENT, antigravity_compatible_schema,
+    GENERATE_CONTENT_API_URL, PersistedCatalog, antigravity_compatible_schema,
     antigravity_user_agent, catalog_is_stale, catalog_model_detail, client_metadata_header,
     is_retryable_empty_turn, merge_antigravity_model_ids, remap_unsupported_model,
+    x_goog_api_client,
 };
 #[cfg(test)]
 use jcode_provider_antigravity::{
@@ -31,6 +32,42 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 const DEFAULT_MODEL: &str = "default";
+
+/// Bound on `generateContent` HTTP 429 retries: the initial attempt plus this
+/// many retries before giving up and surfacing
+/// [`antigravity_rate_limit_error_message`]. See the retry loop in
+/// [`AntigravityProvider::generate_content`] for the reproduced failure mode
+/// this guards against.
+const RATE_LIMIT_MAX_ATTEMPTS: u32 = 4;
+/// Base delay for the exponential backoff between 429 retries, used only when
+/// the response carries no `Retry-After` hint (~2s, ~4s, ~8s before the final
+/// attempt).
+const RATE_LIMIT_BASE_DELAY_MS: u64 = 2_000;
+
+/// User-facing error for a `generateContent` HTTP 429 that survived every
+/// retry. Says plainly that this is probably not real account quota
+/// exhaustion, since the account dashboard, `jcode usage`, and the official
+/// Antigravity IDE can all show/use full quota on the same account at the
+/// same time that this request keeps getting RESOURCE_EXHAUSTED -- see
+/// [`jcode_provider_antigravity::X_GOOG_API_CLIENT`] for what evidence backs
+/// that claim and what remains unconfirmed.
+fn antigravity_rate_limit_error_message(attempts: u32, body: &str) -> String {
+    format!(
+        "Antigravity generateContent failed after {attempts} attempt(s) with HTTP 429 \
+         RESOURCE_EXHAUSTED: {body}\n\n\
+         This is very likely NOT real account quota exhaustion. If your Google AI Pro \
+         dashboard and `jcode usage` both show quota remaining for this account, this looks \
+         like a rate/quota limit scoped to this client's identity or triggered by \
+         abuse-detection heuristics, not your account's real quota -- a known, unresolved \
+         pattern reported against other third-party Antigravity clients (e.g. \
+         github.com/router-for-me/CLIProxyAPI issues #910 and #1015, and \
+         github.com/NoeFabris/opencode-antigravity-auth issue #135), where the official \
+         Antigravity IDE keeps working on the same account while a third-party client gets \
+         this exact error. Things worth trying: wait a few minutes and retry, or set \
+         JCODE_ANTIGRAVITY_API_CLIENT to experiment with a different client-identity header \
+         (no specific alternate value is confirmed to help)."
+    )
+}
 
 pub struct AntigravityProvider {
     client: reqwest::Client,
@@ -401,37 +438,77 @@ impl AntigravityProvider {
             ],
         );
 
-        let response = self
-            .client
-            .post(GENERATE_CONTENT_API_URL)
-            .bearer_auth(&tokens.access_token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, antigravity_user_agent())
-            .header("x-goog-api-client", X_GOOG_API_CLIENT)
-            .header(
-                "x-goog-request-params",
-                format!("project={}", request.project),
-            )
-            .header("x-goog-client-metadata", client_metadata_header())
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send Antigravity generateContent request")?;
+        // `generateContent` has a real, reproduced failure mode where the
+        // backend returns HTTP 429 RESOURCE_EXHAUSTED even though the
+        // account's own quota surfaces (the Google AI Pro dashboard,
+        // `fetchAvailableModels`'s quota_info, and this same account working
+        // fine through the official Antigravity IDE moments earlier) all show
+        // plenty of headroom. See [`jcode_provider_antigravity::X_GOOG_API_CLIENT`]
+        // for what is and isn't known about the cause. Since it is
+        // indistinguishable from a transient rate limit from here, retry a
+        // bounded number of times with backoff (honoring a server
+        // `Retry-After` hint when present) before giving up with an error
+        // that says plainly this is probably not real quota exhaustion.
+        let mut rate_limit_attempt = 0u32;
+        loop {
+            let response = self
+                .client
+                .post(GENERATE_CONTENT_API_URL)
+                .bearer_auth(&tokens.access_token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, antigravity_user_agent())
+                .header("x-goog-api-client", x_goog_api_client())
+                .header(
+                    "x-goog-request-params",
+                    format!("project={}", request.project),
+                )
+                .header("x-goog-client-metadata", client_metadata_header())
+                .json(&request)
+                .send()
+                .await
+                .context("Failed to send Antigravity generateContent request")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = jcode_base::util::http_error_body(response, "HTTP error").await;
-            anyhow::bail!(
-                "Antigravity generateContent failed (HTTP {}): {}",
-                status,
-                body.trim()
-            );
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = jcode_provider_core::retry_after::retry_after(response.headers());
+                let body = jcode_base::util::http_error_body(response, "HTTP error").await;
+
+                if rate_limit_attempt + 1 < RATE_LIMIT_MAX_ATTEMPTS {
+                    rate_limit_attempt += 1;
+                    let delay = jcode_provider_core::retry_after::retry_delay(
+                        rate_limit_attempt,
+                        RATE_LIMIT_BASE_DELAY_MS,
+                        retry_after.map(|hint| hint.remaining()),
+                    );
+                    jcode_base::logging::warn(&format!(
+                        "Antigravity generateContent returned HTTP 429 (attempt {}/{}); retrying in {:?} \
+                         -- this usually is not real account quota exhaustion: {}",
+                        rate_limit_attempt, RATE_LIMIT_MAX_ATTEMPTS, delay, body.trim()
+                    ));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                anyhow::bail!(antigravity_rate_limit_error_message(
+                    RATE_LIMIT_MAX_ATTEMPTS,
+                    body.trim()
+                ));
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = jcode_base::util::http_error_body(response, "HTTP error").await;
+                anyhow::bail!(
+                    "Antigravity generateContent failed (HTTP {}): {}",
+                    status,
+                    body.trim()
+                );
+            }
+
+            return response
+                .json()
+                .await
+                .context("Failed to decode Antigravity generateContent response");
         }
-
-        response
-            .json()
-            .await
-            .context("Failed to decode Antigravity generateContent response")
     }
 }
 
