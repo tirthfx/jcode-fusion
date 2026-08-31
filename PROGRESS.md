@@ -571,6 +571,16 @@ At the user's request to check what `opencode-antigravity-auth`/`gemini-cli` act
 
 **This closes out the client-side investigation for real.** Every concrete, testable hypothesis (header presence, header content, a legitimate alternate product identity, upstream having a newer fix) has been checked against the live API or upstream source, not just reasoned about, and each came back negative. The only remaining lever is account-level (a second licensed Google account), not code-level.
 
+## Real, user-blocking bug fixed: Antigravity login couldn't switch Google accounts (2026-08-31)
+
+While setting up a second Google account for manual Antigravity-quota fallback (the community's own real mitigation, per the section above), the user's second-account login silently signed back into the *first* account instead -- `~/.jcode/antigravity_oauth.json`'s email and its file mtime were both unchanged after completing the browser OAuth flow.
+
+**Root cause, in `crates/jcode-base/src/auth/antigravity.rs::build_auth_url`**: the Google OAuth authorize URL used `prompt=consent` only. Google's OAuth spec (`prompt` is a documented space-separated value list) treats a bare `consent` as "just re-confirm consent for whatever account is already signed into this browser" -- it never shows an account chooser, so a browser already authenticated as account 1 silently completes the flow as account 1 again, with no way to pick a different one short of a full browser sign-out (which the user correctly didn't want -- it would also sign them out of every other Google-authenticated site).
+
+**Fixed**: added `select_account` to the prompt list (`prompt=select_account%20consent`) -- forces Google's account chooser to appear first, letting the user pick any already-signed-in account or add a new one, without touching their session for any other account or site. This function is genuinely untouched upstream jcode code (`git diff v0.81.2` confirmed empty for this file before this change) -- fixed anyway rather than deferred, since it directly blocked a real task the user was doing right now, not a scan-triage scope-creep call.
+
+New regression test asserting the URL contains `select_account` in its prompt list. `jcode-base`: 1320 passed, 21 failed -- exact standing baseline (+1 from the new test), zero regressions. Full binary rebuilds clean, zero new warnings.
+
 ## Next steps (pick up here)
 
 1. **Phase 3, orchestration-as-script**: `save`/`list`/`run` are wired and tested, but `run`'s actual `Request::CommSeedGraph` round trip has never been exercised against a live daemon (same category of gap as every other slice's "no live-credentialed run yet" note) — worth covering once a live verification session happens. No Starlark scripting inside a template yet (reuse the existing dependency, don't add `rhai` — see above). No template versioning/migration story if the shape changes again.

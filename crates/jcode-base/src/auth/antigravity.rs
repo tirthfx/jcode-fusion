@@ -489,8 +489,24 @@ pub async fn fetch_project_id(access_token: &str) -> Result<String> {
 pub fn build_auth_url(redirect_uri: &str, challenge: &str, state: &str) -> Result<String> {
     let scope = ANTIGRAVITY_SCOPES.join(" ");
     let client_id = antigravity_client_id();
+    // `prompt=consent` alone genuinely diverges from upstream jcode here
+    // (confirmed via `git diff v0.81.2`, not assumed) -- but a real,
+    // user-reported problem justified fixing it directly rather than
+    // deferring: Google's OAuth `prompt` parameter silently reuses whatever
+    // Google account is already signed into the user's browser when it
+    // isn't told otherwise, so logging in a *second* Antigravity account
+    // (this provider has exactly one credential slot, see `tokens_path`)
+    // required either fully signing out of the browser first (disruptive --
+    // it signs the user out of every other Google-authenticated site too)
+    // or, correctly, adding `select_account` to the prompt list. Google's
+    // OAuth spec documents `prompt` as a space-separated list of values
+    // (https://developers.google.com/identity/protocols/oauth2/web-server#creatingclient);
+    // `select_account consent` forces the account chooser to appear first
+    // -- letting the user pick any already-signed-in Google account, or
+    // "Use another account" to add a new one -- without touching their
+    // existing browser session for any other account or site at all.
     Ok(format!(
-        "{base}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&code_challenge={challenge}&code_challenge_method=S256&state={state}&access_type=offline&prompt=consent",
+        "{base}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&code_challenge={challenge}&code_challenge_method=S256&state={state}&access_type=offline&prompt=select_account%20consent",
         base = GOOGLE_AUTHORIZE_URL,
         client_id = urlencoding::encode(&client_id),
         redirect_uri = urlencoding::encode(redirect_uri),
@@ -575,6 +591,30 @@ mod tests {
         assert!(url.contains("cloud-platform"));
         assert!(url.contains("experimentsandconfigs"));
         crate::env::remove_var(CLIENT_ID_ENV);
+    }
+
+    #[test]
+    fn build_auth_url_forces_the_account_chooser_without_requiring_sign_out() {
+        // Regression for a real, user-reported problem: with only
+        // `prompt=consent`, Google silently reused whatever account was
+        // already signed into the user's browser when logging in a second
+        // Antigravity account, since this provider has exactly one
+        // credential slot and no way to pick "a different account" without
+        // this. Fixed by adding `select_account` to the prompt list --
+        // forces the account chooser to appear, without touching the
+        // user's existing session for any other account or site.
+        let _guard = lock_test_env();
+        let url = build_auth_url(
+            "http://127.0.0.1:51121/oauth-callback",
+            "challenge",
+            "state",
+        )
+        .expect("build auth url");
+        assert!(
+            url.contains("prompt=select_account%20consent"),
+            "must request the account chooser, not just consent, so a second \
+             account can be selected without signing out of the first: {url}"
+        );
     }
 
     #[test]
