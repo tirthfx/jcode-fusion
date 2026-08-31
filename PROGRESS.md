@@ -581,6 +581,18 @@ While setting up a second Google account for manual Antigravity-quota fallback (
 
 New regression test asserting the URL contains `select_account` in its prompt list. `jcode-base`: 1320 passed, 21 failed -- exact standing baseline (+1 from the new test), zero regressions. Full binary rebuilds clean, zero new warnings.
 
+## Antigravity 429: a second account hit the identical error on its first-ever request -- real evidence the gate isn't per-account at all (2026-08-31)
+
+After the `select_account` OAuth fix above, the user logged into a genuinely different, freshly-added second Google account (`hiteshborkar48@gmail.com`, project `xenon-bliss-87c1c`, confirmed distinct from account 1's `pioneering-xyston-kj013`). jcode's own post-login validation immediately smoke-tested it with a real `generateContent` call -- and got the identical `429 RESOURCE_EXHAUSTED`, on an account's very first-ever request to this API.
+
+**This is a real, important update to the working model, not just another negative result.** A brand-new account hitting the same wall on request #1 rules out a purely per-account quota explanation -- if it were account-specific, a never-before-used account should have full headroom. The gate has to be something *shared* across both accounts' requests.
+
+**The most likely shared factor, not yet confirmed but well-supported by tonight's own evidence**: both accounts authenticate through the exact same hardcoded OAuth client id (`ANTIGRAVITY_CLIENT_ID`, `crates/jcode-base/src/auth/antigravity.rs`) -- the real Antigravity desktop app's own registered client, which every third-party tool using this API (this fork included) also authenticates through. If Google enforces quota at the *(OAuth client × endpoint)* level rather than purely per-end-user, every request through that client shares one pool regardless of which Google account is behind it. Tonight's own investigation sent a real, non-trivial volume of requests through this exact client -- several live TUI attempts, several raw `curl` probes testing different header combinations, several `jcode-fusion run` smoke tests -- all attributable to *this session's own testing*, not the user's normal usage.
+
+**Consequence, taken seriously**: further live testing right now, on either account, risks worsening whatever short-term rate window this is, not diagnosing it further. Stopped active probing for the rest of this session as a result. If this hypothesis is right, the real signal to watch for is whether the SAME accounts succeed again after a genuine cooldown (the model catalog's own `resets in ~4-5h` windows, observed earlier tonight) with request volume kept deliberately low -- not immediately re-testing.
+
+**Both real Google accounts' credentials backed up** (read-only copies, not the active slot) at `~/.jcode/antigravity_oauth_account1_tshendage61.json` and `~/.jcode/antigravity_oauth_account2_hiteshborkar48.json`, for manual swapping into the single active `~/.jcode/antigravity_oauth.json` slot later, per the user's own chosen "manual fallback, no new rotation code" scope from earlier tonight.
+
 ## Next steps (pick up here)
 
 1. **Phase 3, orchestration-as-script**: `save`/`list`/`run` are wired and tested, but `run`'s actual `Request::CommSeedGraph` round trip has never been exercised against a live daemon (same category of gap as every other slice's "no live-credentialed run yet" note) — worth covering once a live verification session happens. No Starlark scripting inside a template yet (reuse the existing dependency, don't add `rhai` — see above). No template versioning/migration story if the shape changes again.
