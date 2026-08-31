@@ -957,6 +957,20 @@ impl Agent {
 
     /// Extract memories from the session transcript
     /// Returns the number of memories extracted, or 0 if none/skipped
+    ///
+    /// **Real bug fix, caught by a full-repo review**: this is one of two
+    /// entirely independent mechanisms that can extract a session's
+    /// memories -- this one, run on an interactive CLI session's normal
+    /// exit; the other, `memory_consolidation::extract_claimed_session`,
+    /// run retroactively by ambient mode via its lease store. Before this
+    /// fix, neither knew the other existed: a session that exited
+    /// interactively (extracted here) could later be re-claimed by ambient
+    /// mode and re-extracted from scratch, producing duplicate memories --
+    /// and the reverse ordering (ambient extracts first, then the same
+    /// session later exits interactively) hit the identical duplication
+    /// from the other direction. Consulting and updating the same lease
+    /// store both mechanisms now share closes that gap: whichever one runs
+    /// first marks the session `Extracted`, so the other skips it.
     pub async fn extract_session_memories(&self) -> usize {
         if !self.memory_enabled {
             return 0;
@@ -965,6 +979,22 @@ impl Agent {
         // Need at least 4 messages for meaningful extraction
         if self.session.messages.len() < crate::memory::MemoryManager::MIN_MESSAGES_FOR_EXTRACTION
         {
+            return 0;
+        }
+
+        // Ambient mode may have already extracted this exact session
+        // retroactively (e.g. between turns, or after a prior crash) --
+        // skip re-extracting from scratch. A lookup failure (lease store
+        // unreadable) is treated as "not extracted yet, proceed" -- the
+        // same fail-open stance `extract_claimed_session` itself takes
+        // whenever a bookkeeping write/read failure shouldn't block real
+        // extraction work.
+        if let Ok(Some(lease)) = crate::memory_consolidation::lease_status(&self.session.id)
+            && lease.status == crate::memory_consolidation::LeaseStatus::Extracted
+        {
+            logging::info(
+                "Memory extraction skipped: already extracted (ambient mode got to it first)",
+            );
             return 0;
         }
 
@@ -1020,9 +1050,30 @@ impl Agent {
                 if stored_count > 0 {
                     logging::info(&format!("Extracted {} memories from session", stored_count));
                 }
+                // A real extraction attempt genuinely completed (whether or
+                // not it found anything worth storing) -- mark it in the
+                // shared lease store so ambient mode's `claim_next_eligible`
+                // skips this session rather than re-extracting it later.
+                // Best-effort: a failure to record this is a missed
+                // dedup opportunity, not a reason to fail the extraction
+                // that already genuinely happened.
+                if let Err(err) = crate::memory_consolidation::mark_extracted(&self.session.id) {
+                    logging::info(&format!(
+                        "Memory extraction succeeded but recording it in the shared lease \
+                         store failed ({err:#}) -- ambient mode may re-extract this session later"
+                    ));
+                }
                 stored_count
             }
-            Ok(_) => 0,
+            Ok(_) => {
+                if let Err(err) = crate::memory_consolidation::mark_extracted(&self.session.id) {
+                    logging::info(&format!(
+                        "Memory extraction found nothing but recording it in the shared lease \
+                         store failed ({err:#}) -- ambient mode may re-check this session later"
+                    ));
+                }
+                0
+            }
             Err(e) => {
                 logging::info(&format!("Memory extraction skipped: {}", e));
                 0

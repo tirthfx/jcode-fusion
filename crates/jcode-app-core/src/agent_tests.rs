@@ -1016,6 +1016,66 @@ async fn restore_session_rehydrates_injected_memory_ids() {
     crate::memory::clear_all_pending_memory();
 }
 
+/// Regression test for a real bug a full-repo review caught: the
+/// interactive-CLI-exit extraction path (`Agent::extract_session_memories`)
+/// and ambient mode's own retroactive extraction
+/// (`memory_consolidation::extract_claimed_session`) used to be entirely
+/// unaware of each other, so a session ambient mode already extracted could
+/// be extracted again from scratch on interactive exit, producing duplicate
+/// memories. This proves the interactive path now consults the same shared
+/// lease store and skips a session ambient mode already marked `Extracted`.
+#[tokio::test]
+async fn extract_session_memories_skips_a_session_ambient_mode_already_extracted() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let session_id = "session_already_extracted_by_ambient";
+    let mut session =
+        crate::session::Session::create_with_id(session_id.to_string(), None, None);
+    for i in 0..6 {
+        let role = if i % 2 == 0 {
+            crate::message::Role::User
+        } else {
+            crate::message::Role::Assistant
+        };
+        session.add_message(
+            role,
+            vec![crate::message::ContentBlock::Text {
+                text: format!("message {i}"),
+                cache_control: None,
+            }],
+        );
+    }
+    session.save().expect("save seeded session");
+
+    // Simulate ambient mode having already extracted this session
+    // retroactively, before it ever exits interactively.
+    crate::memory_consolidation::mark_extracted(session_id).expect("mark extracted");
+
+    agent
+        .restore_session(session_id)
+        .expect("restore session should succeed");
+    agent.set_memory_enabled(true);
+
+    let count = agent.extract_session_memories().await;
+    assert_eq!(
+        count, 0,
+        "must skip extraction entirely, not attempt it a second time"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
 #[tokio::test]
 async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop() {
     let _guard = crate::storage::lock_test_env();
