@@ -310,19 +310,16 @@ pub async fn is_acp_session(session_id: &str) -> bool {
 /// *also* recorded in, alongside the legacy single `event_tx` -- this map
 /// was already there for exactly this kind of "reach one specific
 /// connection, not whichever is primary" need elsewhere in the daemon).
-pub async fn send_acp_callback_for_session(
+/// Resolve the session's primary ACP client's event channel, as two
+/// independent lock acquisitions (`connections` then `members`) -- see
+/// [`send_acp_callback_for_session`]'s own doc comment for the real TOCTOU
+/// window this leaves and why it's retried there rather than "fixed" here
+/// by holding both locks across the gap.
+async fn resolve_acp_event_tx(
     session_id: &str,
-    method: &str,
-    params: Value,
-    timeout: Duration,
-) -> anyhow::Result<Value> {
-    let Some(members) = registered_swarm_members() else {
-        anyhow::bail!("ACP callback dispatcher not initialized (server not fully started?)");
-    };
-    let Some(connections) = registered_client_connections() else {
-        anyhow::bail!("ACP callback dispatcher not initialized (server not fully started?)");
-    };
-
+    members: &SwarmMembers,
+    connections: &ClientConnections,
+) -> Result<tokio::sync::mpsc::UnboundedSender<ServerEvent>, String> {
     // A final full-repo review's own follow-up re-review caught a real,
     // if low-severity, issue in an earlier version of this: `.values()` on
     // a `HashMap` iterates in an *unspecified*, not-even-stable-across-calls
@@ -349,9 +346,9 @@ pub async fn send_acp_callback_for_session(
             .map(|info| info.client_id.clone())
     };
     let Some(acp_client_id) = acp_client_id else {
-        anyhow::bail!(
+        return Err(format!(
             "session '{session_id}' has no ACP-connected client to relay an ACP callback through"
-        );
+        ));
     };
 
     let event_tx = {
@@ -360,10 +357,54 @@ pub async fn send_acp_callback_for_session(
             .get(session_id)
             .and_then(|member| member.event_txs.get(&acp_client_id).cloned())
     };
-    let Some(event_tx) = event_tx else {
-        anyhow::bail!(
+    event_tx.ok_or_else(|| {
+        format!(
             "session '{session_id}'s ACP client (connection '{acp_client_id}') has no live event channel to relay an ACP callback through"
-        );
+        )
+    })
+}
+
+pub async fn send_acp_callback_for_session(
+    session_id: &str,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let Some(members) = registered_swarm_members() else {
+        anyhow::bail!("ACP callback dispatcher not initialized (server not fully started?)");
+    };
+    let Some(connections) = registered_client_connections() else {
+        anyhow::bail!("ACP callback dispatcher not initialized (server not fully started?)");
+    };
+
+    // **Real TOCTOU bug fix, caught by a full-repo review**: resolving the
+    // client id (from `connections`) and its event channel (from `members`)
+    // used to be two independent lock acquisitions with a real gap between
+    // them -- a client that disconnects in that window (removed from
+    // `members`'s `event_txs`, and/or from `connections`) made this fail
+    // with "no live event channel" even though the session was confirmed
+    // ACP-connected moments earlier in the very same call.
+    //
+    // Holding both locks across the whole lookup would close the window,
+    // but doing that safely requires the *entire* rest of this codebase to
+    // never acquire `members` before `connections` (a lock-order inversion
+    // would deadlock) -- both maps are written from many call sites across
+    // `client_session.rs`/`client_lifecycle.rs`/`client_disconnect_cleanup.rs`,
+    // not just one disconnect path, so proving that ordering holds
+    // everywhere is a real audit, not a two-line change. A bounded retry
+    // instead: if the first snapshot's client disconnected mid-lookup, a
+    // second attempt either finds the (possibly new, reconnected) client
+    // cleanly or fails with the *accurate* "no ACP-connected client"
+    // message instead of the confusing "connected moments ago" one --
+    // narrowing the race to needing two disconnects back-to-back within a
+    // single call, without touching lock ordering at all.
+    let event_tx = match resolve_acp_event_tx(session_id, members, connections).await {
+        Ok(event_tx) => event_tx,
+        Err(_first_attempt_err) => {
+            resolve_acp_event_tx(session_id, members, connections)
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?
+        }
     };
 
     send_acp_callback_via_sender(session_id, method, params, timeout, event_tx).await
