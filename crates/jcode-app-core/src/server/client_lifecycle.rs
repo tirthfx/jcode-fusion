@@ -1835,7 +1835,12 @@ pub(super) async fn handle_client(
                         "message": "client sent neither result nor error"
                     })),
                 };
-                super::acp_callback::resolve_acp_callback(id, outcome);
+                // `&client_session_id`: the session this *connection* is
+                // authenticated as, not anything client-supplied on this
+                // request -- `resolve_acp_callback` checks it against the
+                // session the pending callback was actually issued to (see
+                // its own doc comment for the forgery this prevents).
+                super::acp_callback::resolve_acp_callback(id, &client_session_id, outcome);
             }
 
             Request::SetReasoningEffort {

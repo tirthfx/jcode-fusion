@@ -388,6 +388,7 @@ async fn read_tool_routes_through_acp_callback_for_an_acp_connected_session() {
     assert!(params["path"].as_str().unwrap().ends_with("watched.txt"));
     crate::server::acp_callback::resolve_acp_callback(
         id,
+        session_id,
         Ok(json!({"content": "live editor buffer content\n"})),
     );
 

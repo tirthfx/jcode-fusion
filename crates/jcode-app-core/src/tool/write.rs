@@ -446,7 +446,7 @@ mod tests {
         };
         assert_eq!(method, "fs/read_text_file");
         assert!(params["path"].as_str().unwrap().ends_with("new_file.txt"));
-        crate::server::acp_callback::resolve_acp_callback(id, Ok(json!({})));
+        crate::server::acp_callback::resolve_acp_callback(id, session_id, Ok(json!({})));
 
         // Second callback: the actual write.
         let event = event_rx.recv().await.expect("write callback sent");
@@ -455,7 +455,7 @@ mod tests {
         };
         assert_eq!(method, "fs/write_text_file");
         assert_eq!(params["content"], "hello from acp\n");
-        crate::server::acp_callback::resolve_acp_callback(id, Ok(json!({})));
+        crate::server::acp_callback::resolve_acp_callback(id, session_id, Ok(json!({})));
 
         let output = call
             .await

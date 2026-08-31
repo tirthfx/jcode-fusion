@@ -29,8 +29,11 @@ use crate::protocol::ServerEvent;
 
 use super::{ClientConnectionInfo, SwarmMember};
 
+/// Each pending callback is keyed by its id, but also records which
+/// session it was actually issued to -- see [`resolve_acp_callback`]'s doc
+/// comment for why the id alone isn't enough to trust a response against.
 type PendingAcpCallbacks =
-    Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value, Value>>>>;
+    Mutex<HashMap<u64, (String, oneshot::Sender<std::result::Result<Value, Value>>)>>;
 
 fn pending_callbacks() -> &'static PendingAcpCallbacks {
     static PENDING: OnceLock<PendingAcpCallbacks> = OnceLock::new();
@@ -92,7 +95,7 @@ async fn send_acp_callback_via_sender(
         let mut pending = pending_callbacks()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.insert(id, tx);
+        pending.insert(id, (session_id.to_string(), tx));
     }
     let _cleanup_guard = PendingCallbackGuard { id };
 
@@ -130,12 +133,51 @@ async fn send_acp_callback_via_sender(
 /// dropped, not an error -- the same "an unmatched response is the
 /// client's problem, not ours" stance `route_response` already takes on
 /// the ACP-adapter side of this exact same pattern.
-pub fn resolve_acp_callback(id: u64, result: std::result::Result<Value, Value>) {
-    let waiter = pending_callbacks()
+///
+/// **Real security bug fix, caught by a full-repo review**: this used to
+/// resolve purely by `id` -- a single process-wide `AtomicU64` counter
+/// shared across every session's callbacks, with no check that
+/// `responder_session_id` (the connection actually sending this response)
+/// matches the session the callback was issued to. Any connected client
+/// could send a `Request::AcpCallbackResponse` with a guessed or observed
+/// id (trivial: the counter is sequential and global) and forge another
+/// session's `fs/read_text_file`/`fs/write_text_file` callback result --
+/// injecting fake file content into another session's `ReadTool` result,
+/// or falsely acking a `WriteTool` write that never happened.
+///
+/// A mismatched id is left in place (not removed) rather than treated as
+/// "consume it anyway" or "drop it" -- either would let a forged response
+/// (with a guessed id for a callback it doesn't own) cancel/starve the
+/// *real* session's still-pending wait, a denial-of-service on top of the
+/// spoofing attempt. Leaving it untouched means the legitimate session can
+/// still answer it later, or it times out exactly as if the forged
+/// response had never arrived.
+pub fn resolve_acp_callback(
+    id: u64,
+    responder_session_id: &str,
+    result: std::result::Result<Value, Value>,
+) {
+    let mut pending = pending_callbacks()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&id);
-    if let Some(waiter) = waiter {
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let Some((owner_session_id, _)) = pending.get(&id) else {
+        // No matching waiter at all -- already timed out, already resolved,
+        // or an id nobody ever issued. Same "not our problem" stance as
+        // before.
+        return;
+    };
+
+    if owner_session_id != responder_session_id {
+        crate::logging::warn(&format!(
+            "ACP callback response for id {id} came from session \
+             '{responder_session_id}' but was issued to a different session -- \
+             ignoring (possible cross-session forgery attempt)"
+        ));
+        return;
+    }
+
+    if let Some((_, waiter)) = pending.remove(&id) {
         let _ = waiter.send(result);
     }
 }
@@ -494,7 +536,7 @@ mod tests {
         assert_eq!(method, "fs/read_text_file");
         assert_eq!(params["path"], "/tmp/x");
 
-        resolve_acp_callback(id, Ok(serde_json::json!({"content": "file contents"})));
+        resolve_acp_callback(id, "sess-1", Ok(serde_json::json!({"content": "file contents"})));
 
         let result = call.await.expect("task").expect("should resolve");
         assert_eq!(result, serde_json::json!({"content": "file contents"}));
@@ -519,7 +561,11 @@ mod tests {
         let ServerEvent::AcpCallbackRequest { id, .. } = event else {
             panic!("expected AcpCallbackRequest");
         };
-        resolve_acp_callback(id, Err(serde_json::json!({"message": "permission denied"})));
+        resolve_acp_callback(
+            id,
+            "sess-1",
+            Err(serde_json::json!({"message": "permission denied"})),
+        );
 
         let result = call.await.expect("task");
         assert!(result.is_err());
@@ -552,7 +598,59 @@ mod tests {
     fn resolve_acp_callback_silently_drops_a_response_with_no_matching_waiter() {
         // Must not panic on an id nothing is waiting for -- e.g. already
         // timed out, or an id the client made up.
-        resolve_acp_callback(u64::MAX, Ok(serde_json::json!({})));
+        resolve_acp_callback(u64::MAX, "sess-1", Ok(serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn resolve_acp_callback_rejects_a_response_from_a_different_session() {
+        // Regression test for a real, high-severity security bug a
+        // full-repo review caught: resolving purely by `id` -- a single
+        // process-wide counter shared across every session -- let any
+        // connected client forge another session's callback response by
+        // guessing or observing an id. This proves a response claiming to
+        // come from a session other than the one the callback was actually
+        // issued to is ignored, not resolved.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let call = tokio::spawn(async move {
+            send_acp_callback_via_sender(
+                "victim-session",
+                "fs/read_text_file",
+                serde_json::json!({"path": "/etc/secret"}),
+                Duration::from_millis(200),
+                event_tx,
+            )
+            .await
+        });
+
+        let event = event_rx.recv().await.expect("event sent");
+        let ServerEvent::AcpCallbackRequest { id, .. } = event else {
+            panic!("expected AcpCallbackRequest, got {event:?}");
+        };
+
+        // The attacker's own session, not "victim-session" -- guessed or
+        // observed this id (the counter is sequential and global).
+        resolve_acp_callback(
+            id,
+            "attacker-session",
+            Ok(serde_json::json!({"content": "forged content"})),
+        );
+
+        // Must still be pending -- a forged response must not be able to
+        // resolve (or cancel/consume) the real waiter.
+        assert!(
+            pending_callbacks().lock().unwrap().contains_key(&id),
+            "a cross-session response must not consume the pending entry"
+        );
+
+        // The legitimate session can still answer for real afterward.
+        resolve_acp_callback(
+            id,
+            "victim-session",
+            Ok(serde_json::json!({"content": "real content"})),
+        );
+        let result = call.await.expect("task").expect("should resolve");
+        assert_eq!(result, serde_json::json!({"content": "real content"}));
     }
 
     #[tokio::test]
@@ -614,7 +712,11 @@ mod tests {
         let ServerEvent::AcpCallbackRequest { id, .. } = event else {
             panic!("expected AcpCallbackRequest, got {event:?}");
         };
-        resolve_acp_callback(id, Ok(serde_json::json!({"content": "real content"})));
+        resolve_acp_callback(
+            id,
+            session_id,
+            Ok(serde_json::json!({"content": "real content"})),
+        );
 
         let result = call.await.expect("task").expect("should resolve");
         assert_eq!(result, serde_json::json!({"content": "real content"}));
