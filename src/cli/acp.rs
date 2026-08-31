@@ -545,9 +545,10 @@ impl AcpRuntime {
                 .await?;
             return Ok(());
         }
+        let mcp_servers = parse_acp_mcp_servers(&message.params);
 
         match self
-            .attach_existing_session(session_id.clone(), cwd, replay_history)
+            .attach_existing_session(session_id.clone(), cwd, replay_history, mcp_servers)
             .await
         {
             Ok(session) => {
@@ -905,55 +906,7 @@ impl AcpRuntime {
         // #7): connect each on this same daemon connection, before handing
         // the session back to the client, so a tool call the client makes
         // immediately after `session/new` returns can already see them.
-        // Fail-soft per server, matching `validate_acp_mcp_servers`'s own
-        // "don't reject the session over this" stance -- one bad server
-        // config shouldn't take down session creation for the rest.
-        //
-        // Gemini review, 2026-08-30: sequential + unbounded `wait_for_done`
-        // meant one hanging MCP server subprocess (bad handshake, waiting on
-        // stdin, etc.) would block `session/new` indefinitely -- likely
-        // outlasting the ACP host's own request timeout. Each connect now
-        // gets a bounded wait; a timeout is reported and skipped, not left
-        // to hang the whole session. Sequential dispatch (not concurrent)
-        // is kept deliberately: the daemon processes one client request at
-        // a time per connection, so true concurrency here would need the
-        // server-side handler to be spawned rather than awaited -- a larger
-        // change than this slice's scope.
-        const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-        for server in mcp_servers {
-            let request_id = session.next_id();
-            let name = server.name.clone();
-            let send_result = session
-                .send(&Request::McpConnectServer {
-                    id: request_id,
-                    server: server.name,
-                    command: server.command,
-                    args: server.args,
-                    env: server.env,
-                })
-                .await;
-            if let Err(err) = send_result {
-                crate::logging::warn(&format!(
-                    "ACP session/new: failed to send mcp connect request for '{name}': {err:#}"
-                ));
-                continue;
-            }
-            match tokio::time::timeout(MCP_CONNECT_TIMEOUT, wait_for_done(&session, request_id))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    crate::logging::warn(&format!(
-                        "ACP session/new: mcp server '{name}' failed to connect: {err:#}"
-                    ));
-                }
-                Err(_) => {
-                    crate::logging::warn(&format!(
-                        "ACP session/new: mcp server '{name}' timed out connecting after {MCP_CONNECT_TIMEOUT:?}, skipping"
-                    ));
-                }
-            }
-        }
+        connect_session_scoped_mcp_servers(&session, mcp_servers, "session/new").await;
 
         Ok(DaemonSession::new(
             session_id,
@@ -969,6 +922,7 @@ impl AcpRuntime {
         target_session_id: String,
         cwd: PathBuf,
         replay_history: bool,
+        mcp_servers: Vec<AcpMcpServerSpec>,
     ) -> Result<DaemonSession> {
         let (reader, writer) = self.connect_daemon().await?;
         let session = DaemonSession::new(String::new(), reader, writer, 2);
@@ -1025,6 +979,22 @@ impl AcpRuntime {
                 }
             }
         }
+
+        // Session-scoped MCP servers (ACP's own `mcpServers`): connect each
+        // on this same daemon connection before handing the session back to
+        // the client -- same treatment `create_new_session` already gives
+        // `session/new`, now shared so `session/resume`/`session/load`
+        // don't silently skip a client-specified `mcpServers` list.
+        connect_session_scoped_mcp_servers(
+            &session,
+            mcp_servers,
+            if replay_history {
+                "session/load"
+            } else {
+                "session/resume"
+            },
+        )
+        .await;
 
         Ok(DaemonSession::new(
             attached_id,
@@ -1539,6 +1509,76 @@ async fn wait_for_done(session: &DaemonSession, request_id: u64) -> Result<()> {
             ServerEvent::Done { id } if id == request_id => return Ok(()),
             ServerEvent::Error { id, message, .. } if id == request_id => anyhow::bail!(message),
             _ => {}
+        }
+    }
+}
+
+/// Connect each of `mcp_servers` on `session`'s existing daemon connection,
+/// sequentially, before the caller hands the session back to the client.
+/// Factored out of `RuntimeAcp::create_new_session` (its original, only
+/// caller) so `attach_existing_session` (`session/resume`/`session/load`)
+/// can share the identical connect behavior instead of silently skipping it.
+///
+/// **Real bug fix, caught by a full-repo review**: `handle_session_load`
+/// validated `mcpServers`' shape via `validate_acp_mcp_servers` but never
+/// actually parsed or connected them, unlike `handle_session_new` which does
+/// both -- an ACP host resuming or loading a session with `mcpServers`
+/// specified got no error, but none of those servers were ever connected,
+/// silently asymmetric versus creating a fresh session with the same
+/// `mcpServers`.
+///
+/// Fail-soft per server, matching `validate_acp_mcp_servers`'s own "don't
+/// reject the session over this" stance -- one bad server config shouldn't
+/// take down session creation/resumption for the rest.
+///
+/// Gemini review, 2026-08-30, on the original `create_new_session`-only
+/// version of this loop: sequential + unbounded `wait_for_done` meant one
+/// hanging MCP server subprocess (bad handshake, waiting on stdin, etc.)
+/// would block the whole call indefinitely -- likely outlasting the ACP
+/// host's own request timeout. Each connect gets a bounded wait; a timeout
+/// is reported and skipped, not left to hang the whole session. Sequential
+/// dispatch (not concurrent) is kept deliberately: the daemon processes one
+/// client request at a time per connection, so true concurrency here would
+/// need the server-side handler to be spawned rather than awaited -- a
+/// larger change than this slice's scope.
+async fn connect_session_scoped_mcp_servers(
+    session: &DaemonSession,
+    mcp_servers: Vec<AcpMcpServerSpec>,
+    call_site: &str,
+) {
+    const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    for server in mcp_servers {
+        let request_id = session.next_id();
+        let name = server.name.clone();
+        let send_result = session
+            .send(&Request::McpConnectServer {
+                id: request_id,
+                server: server.name,
+                command: server.command,
+                args: server.args,
+                env: server.env,
+            })
+            .await;
+        if let Err(err) = send_result {
+            crate::logging::warn(&format!(
+                "ACP {call_site}: failed to send mcp connect request for '{name}': {err:#}"
+            ));
+            continue;
+        }
+        match tokio::time::timeout(MCP_CONNECT_TIMEOUT, wait_for_done(session, request_id)).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                crate::logging::warn(&format!(
+                    "ACP {call_site}: mcp server '{name}' failed to connect: {err:#}"
+                ));
+            }
+            Err(_) => {
+                crate::logging::warn(&format!(
+                    "ACP {call_site}: mcp server '{name}' timed out connecting after \
+                     {MCP_CONNECT_TIMEOUT:?}, skipping"
+                ));
+            }
         }
     }
 }

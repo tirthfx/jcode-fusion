@@ -293,6 +293,37 @@ pub fn mark_failed(session_id: &str, error: &str) -> anyhow::Result<()> {
     save_store(&store)
 }
 
+/// Release a lease this worker currently holds back to [`LeaseStatus::Pending`],
+/// touching neither `attempt_count` nor `last_error` — for an outcome that's
+/// neither success nor failure (e.g. "too few messages, might still be
+/// growing" or "no LLM backend available right now"), just "try again later,
+/// no penalty."
+///
+/// **Real bug fix, caught by a full-repo review**: two call sites used to
+/// handle exactly this "try again later, no fault" outcome by simply
+/// *leaving* the lease in whatever `Leased` state `claim_next_eligible` had
+/// already put it in, relying on it to expire naturally. But once that lease
+/// expires, it is indistinguishable from a worker that crashed mid-extraction
+/// — `claim_next_eligible`'s own crash-loop protection (`was_crashed_lease`)
+/// can't tell the two apart, so it would eventually bump `attempt_count` on
+/// every one of these deliberate, no-fault retries too, permanently excluding
+/// a session (via `MAX_ATTEMPTS`) that never actually failed once. Resetting
+/// to `Pending` immediately — rather than leaving `Leased` to expire on its
+/// own — means the lease was never left dangling, so the crash-only branch is
+/// never mistakenly entered for this case.
+pub fn release_claim(session_id: &str) -> anyhow::Result<()> {
+    let _guard = lock_lease_store();
+    let mut store = load_store()?;
+    let lease = store
+        .leases
+        .entry(session_id.to_string())
+        .or_insert_with(|| SessionLease::pending(session_id));
+    lease.status = LeaseStatus::Pending;
+    lease.leased_by = None;
+    lease.lease_expires_at = None;
+    save_store(&store)
+}
+
 /// Current lease state for a session, if any exists. Read-only —
 /// deliberately doesn't take the lock, since a snapshot read racing a
 /// concurrent claim is fine for observability (e.g. a status/debug
@@ -466,8 +497,11 @@ pub async fn run_one_ambient_extraction(worker_id: &str) -> anyhow::Result<Optio
 /// unfinalized -- neither `Extracted` nor `Failed` -- since "too few
 /// messages right now" can't be told apart from "still actively growing,
 /// just caught early" (see this function body's own doc comment on that
-/// exact bug and its rejected first fix attempt). The lease simply stays
-/// `Leased` and naturally becomes reclaimable again once it expires.
+/// exact bug and its rejected first fix attempts). The lease is released
+/// back to `Pending` via [`release_claim`] (not simply left `Leased` to
+/// expire on its own -- see that function's doc comment for why), so it
+/// naturally becomes reclaimable on a later cycle with no penalty. The same
+/// treatment applies when no LLM backend is available right now.
 ///
 /// Returns the number of memories actually stored on success. Errors
 /// (session failed to load, extraction itself failed) are both surfaced to
@@ -511,12 +545,12 @@ pub async fn extract_claimed_session(session_id: &str) -> anyhow::Result<usize> 
         // alone.
         //
         // Fixed properly by never finalizing a too-short session at all --
-        // simply return without calling `mark_extracted`/`mark_failed`,
-        // leaving the lease in its current `Leased` state so it naturally
-        // becomes reclaimable once that lease expires (the same
-        // self-healing "stays Leased, retried later" outcome already used a
-        // few lines below for a lease-bookkeeping write failure). This
-        // means a session that's genuinely finished and short gets
+        // release the lease back to `Pending` instead (see
+        // [`release_claim`]'s own doc comment for why that's not simply
+        // "leave it `Leased` to expire on its own" -- that first version of
+        // this fix reintroduced a second, subtler permanent-exclusion bug
+        // via the crash-loop protection above, caught by a later review).
+        // This means a session that's genuinely finished and short gets
         // re-checked again every lease window, forever -- but that check is
         // just a cheap session load and message count, no LLM call, nowhere
         // near the wasteful-retry cost the original design's own comment
@@ -524,6 +558,26 @@ pub async fn extract_claimed_session(session_id: &str) -> anyhow::Result<usize> 
         // extraction attempt being retried under backoff, not this
         // near-free case) -- a real, bounded cost, and a far smaller one
         // than the silent, permanent data loss this now avoids.
+        release_claim(session_id).ok();
+        return Ok(0);
+    }
+
+    if !crate::memory::memory_llm_judge_available() {
+        // Real bug fix, caught by a full-repo review: `extract_from_transcript`
+        // itself treats "LLM judge unavailable right now" as a graceful
+        // `Ok(Vec::new())` no-op -- indistinguishable, at this call site,
+        // from "the LLM ran and genuinely found nothing worth extracting."
+        // The match below used to treat both identically and call
+        // `mark_extracted` either way, which is correct for the real
+        // no-op-with-no-memories case but wrong here: a session claimed
+        // during an outage window (no backend configured, sidecar
+        // unreachable) would be permanently marked `Extracted` and never
+        // revisited even after the backend comes back. Checking this
+        // up front and releasing the lease (not finalizing at all, same
+        // "try again later, no fault" treatment as the too-short case
+        // above) means it stays eligible for a real extraction attempt once
+        // the backend is actually available again.
+        release_claim(session_id).ok();
         return Ok(0);
     }
 
@@ -778,13 +832,14 @@ mod tests {
         // lunch, and then resumed, hits the identical failure). No
         // message-count-plus-recency heuristic can tell "paused, will
         // resume" apart from "actually done" -- so this proves the lease is
-        // simply left `Leased` (naturally reclaimable on a later cycle,
-        // forever, at near-zero cost) rather than ever finalized, for a
-        // too-short session regardless of how long it's been quiet. Ambient
-        // mode's whole documented purpose is a retroactive safety net for a
-        // session that crashes later -- permanently marking a too-short
-        // session `Extracted` on any timeline would silently defeat that
-        // for exactly the sessions caught earliest.
+        // released back to `Pending` (naturally reclaimable on a later
+        // cycle, forever, at near-zero cost, with `attempt_count` left
+        // untouched) rather than ever finalized, for a too-short session
+        // regardless of how long it's been quiet. Ambient mode's whole
+        // documented purpose is a retroactive safety net for a session that
+        // crashes later -- permanently marking a too-short session
+        // `Extracted` on any timeline would silently defeat that for
+        // exactly the sessions caught earliest.
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         crate::env::set_var("JCODE_HOME", temp.path());
@@ -801,9 +856,42 @@ mod tests {
         let lease = lease_status("short").expect("status").expect("exists");
         assert_eq!(
             lease.status,
-            LeaseStatus::Leased,
+            LeaseStatus::Pending,
             "a too-short session must never be finalized -- it may still be growing, on any timeline"
         );
+        assert_eq!(
+            lease.attempt_count, 0,
+            "deferring a decision on a too-short session is not a fault -- must not count \
+             toward MAX_ATTEMPTS"
+        );
+    }
+
+    #[test]
+    fn a_released_lease_reclaimed_after_expiry_does_not_accumulate_attempts() {
+        // Regression for the bug this fix's own first attempt (see the test
+        // above) would have reintroduced: leaving the lease `Leased` to
+        // expire on its own looks identical, once expired, to a crashed
+        // worker -- `claim_next_eligible`'s crash-loop protection would then
+        // bump `attempt_count` on every single reclaim, permanently
+        // excluding a session that never actually failed once it later
+        // grows past the threshold. Releasing to `Pending` immediately means
+        // repeated claim/release cycles never trip that crash-only branch.
+        with_isolated_home(|| {
+            for _ in 0..(MAX_ATTEMPTS + 2) {
+                claim_next_eligible(&["short".to_string()], "worker-1", DEFAULT_LEASE_DURATION)
+                    .expect("claim");
+                release_claim("short").expect("release");
+            }
+            let lease = lease_status("short").expect("status").expect("exists");
+            assert_eq!(
+                lease.attempt_count, 0,
+                "a deliberately-released lease must never accumulate crash-loop attempts"
+            );
+            assert!(
+                lease.is_eligible(SystemTime::now()),
+                "must still be eligible after many release cycles, not permanently excluded"
+            );
+        });
     }
 
     #[tokio::test]
@@ -831,12 +919,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_claimed_session_marks_extracted_when_the_llm_judge_is_unavailable() {
-        // A long-enough session in a test environment with no LLM backend
-        // configured takes extract_from_transcript's own graceful "judge
-        // unavailable, return no memories" path (not an error) -- this
-        // exercises the real, non-mocked function, matching this project's
-        // usual "genuinely tests without needing live credentials" bar.
+    async fn extract_claimed_session_releases_the_lease_when_the_llm_judge_is_unavailable() {
+        // Regression for a real bug a full-repo review caught: this used to
+        // assert `LeaseStatus::Extracted` here, codifying the very bug it
+        // exposed -- a session claimed during an LLM-outage window (no
+        // backend configured, sidecar unreachable) was permanently marked
+        // `Extracted` with zero memories and never revisited, even after the
+        // backend later became available. A long-enough session in a test
+        // environment with no LLM backend configured exercises the real,
+        // non-mocked unavailability check, matching this project's usual
+        // "genuinely tests without needing live credentials" bar.
         let _guard = crate::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         crate::env::set_var("JCODE_HOME", temp.path());
@@ -854,13 +946,18 @@ mod tests {
             .expect("must succeed cleanly with no LLM backend configured");
         assert_eq!(
             count, 0,
-            "no backend available -- extract_from_transcript's own graceful no-op path"
+            "no backend available -- must not attempt extraction at all"
         );
 
         let lease = lease_status("long-enough")
             .expect("status")
             .expect("exists");
-        assert_eq!(lease.status, LeaseStatus::Extracted);
+        assert_eq!(
+            lease.status,
+            LeaseStatus::Pending,
+            "must be released, not finalized, so a later cycle retries once a backend is available"
+        );
+        assert_eq!(lease.attempt_count, 0, "an outage is not this session's fault");
     }
 
     // --- candidate_session_ids / ambient wiring ---
@@ -1018,13 +1115,19 @@ mod tests {
         assert_eq!(
             count,
             Some(0),
-            "no backend available in the test environment -- extract_from_transcript's own graceful no-op"
+            "no backend available in the test environment -- extract_claimed_session's own \
+             up-front unavailability check"
         );
 
         let lease = lease_status("ready-for-extraction")
             .expect("status")
             .expect("a claim must have happened");
-        assert_eq!(lease.status, LeaseStatus::Extracted);
+        assert_eq!(
+            lease.status,
+            LeaseStatus::Pending,
+            "no backend available -- must release, not finalize, so a later cycle retries \
+             once a backend is available"
+        );
     }
 
     #[tokio::test]

@@ -507,10 +507,29 @@ impl McpManagementTool {
                         ("error", e.to_string()),
                     ],
                 );
-                Ok(
-                    ToolOutput::new(format!("Failed to connect to '{}': {}", server_name, e))
-                        .with_title("MCP: Connection failed"),
-                )
+                // Real bug fix, caught by a full-repo review: this used to
+                // return `Ok(ToolOutput::new("Failed to connect..."))` --
+                // success from the tool-execution machinery's point of view,
+                // with the failure only visible in the output *text*.
+                // `handle_mcp_connect_server` (server/client_actions.rs),
+                // the ACP `session/new` MCP-connect call site, branches
+                // purely on `Ok`/`Err` and sends the host `ServerEvent::Done`
+                // on any `Ok(_)` -- so a session-scoped MCP server that fails
+                // its handshake (bad command, crashed subprocess, timeout)
+                // was reported to the ACP host as successfully connected.
+                // `ToolOutput` has no separate "is_error" field (verified:
+                // this codebase's established convention for a failed tool
+                // call is returning `Err`, not an `Ok` whose text happens to
+                // say "Failed"), so `Err` here is the correct fix for both
+                // callers -- the ACP path above, and the agent-tool-use path
+                // (an LLM agent calling this tool directly), which already
+                // treats `Err` as a proper tool error rather than a normal
+                // result it has to parse free text to notice failed.
+                Err(anyhow::anyhow!(
+                    "Failed to connect to '{}': {}",
+                    server_name,
+                    e
+                ))
             }
         }
     }
@@ -824,6 +843,35 @@ mod tests {
         let result = tool.execute(input, ctx).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("command"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_unspawnable_command_returns_err_not_ok() {
+        // Regression for a real bug a full-repo review caught: a connect
+        // failure used to come back as `Ok(ToolOutput::new("Failed to
+        // connect..."))` -- success from the tool-execution machinery's
+        // point of view, with the failure visible only in the output text.
+        // The ACP `session/new` MCP-connect call site
+        // (`handle_mcp_connect_server`, server/client_actions.rs) branches
+        // purely on `Ok`/`Err` and reported any `Ok(_)` to the host as a
+        // successful connection. A nonexistent binary as the command is
+        // guaranteed to fail to spawn, exercising the real (non-mocked)
+        // connect path end to end.
+        let tool = create_test_tool();
+        let ctx = create_test_context();
+        let input = json!({
+            "action": "connect",
+            "server": "definitely-not-a-real-server",
+            "command": "/definitely/not/a/real/binary/on/any/machine",
+        });
+
+        let result = tool.execute(input, ctx).await;
+        assert!(
+            result.is_err(),
+            "a connect failure must surface as Err, not a text-only Ok, so callers that branch \
+             on Ok/Err (like the ACP session/new MCP-connect path) don't report it as success"
+        );
+        assert!(result.unwrap_err().to_string().contains("Failed to connect"));
     }
 
     #[tokio::test]

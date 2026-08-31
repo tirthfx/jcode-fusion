@@ -190,9 +190,20 @@ fn category_heading(category: &str) -> String {
 /// function serialized by the lock -- but the lock only ever protected the
 /// second one from clobbering the first one's *write*, not from the two
 /// passes racing on what the "current" memory set even was to begin with.
-/// Taking `&MemoryManager` and calling `list_all()` here, inside the lock,
-/// means the read-current-state-then-render-then-write sequence is what's
-/// actually serialized, not just its last step.
+/// Taking `&MemoryManager` and gathering here, inside the lock, means the
+/// read-current-state-then-render-then-write sequence is what's actually
+/// serialized, not just its last step.
+///
+/// **Second real gap fixed here, caught by a later full-repo review**: the
+/// gather itself used to call `manager.list_all()`, which only reads
+/// whichever single project (or none) `manager` happens to be scoped to.
+/// Extraction stores into project scope whenever a session has a
+/// `working_dir` (the common case, see `memory_consolidation::
+/// extract_claimed_session`), while `run_memory_md_consolidation` below
+/// constructs `manager` with no project at all -- so `MEMORY.md` silently
+/// never reflected any project-scoped memory. Calling `manager.
+/// list_all_projects_and_global()` instead aggregates the global graph plus
+/// every known project graph on disk, still gathered inside this same lock.
 ///
 /// Uses `jcode_storage`'s atomic write (temp file + rename, the same
 /// primitive every other persisted-state module in this project already
@@ -204,7 +215,7 @@ pub fn write_consolidated_memory_file(
     generated_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let _guard = lock_consolidation();
-    let memories = manager.list_all()?;
+    let memories = manager.list_all_projects_and_global()?;
     let document = render_memory_document(&memories, generated_at);
 
     // Gemini review, 2026-08-30: the rendered document always embeds
@@ -259,21 +270,25 @@ pub fn is_memory_md_wiring_enabled() -> bool {
 /// simplification, not the original design's assumption**: `PROGRESS.md`'s
 /// scoping note for this phase assumed a project's own git-tracked root
 /// (matching this phase's original "under a git-baselined directory"
-/// framing) -- but the ambient cycle this gets triggered from already
-/// treats memory operations as global-scope, not project-scoped (see
-/// `backfill_embeddings`'s own sibling call in `ambient/runner.rs`,
-/// constructed with no project directory either). Picking a per-project
-/// path would need the ambient cycle to know *which* project it's
-/// consolidating for, which it doesn't reliably have one single answer to.
-/// `~/.jcode/MEMORY.md` is consistent with that existing precedent, not a
-/// new design decision invented here -- revisit if a future slice adds
-/// real per-project ambient scoping.
+/// framing) -- but the ambient cycle this gets triggered from has no single
+/// "current project" to pick (see `backfill_embeddings`'s own sibling call
+/// in `ambient/runner.rs`, constructed with no project directory either).
+/// Picking a per-project path would need the ambient cycle to know *which*
+/// project it's consolidating for, which it doesn't reliably have one single
+/// answer to. `~/.jcode/MEMORY.md` is consistent with that existing
+/// precedent as *one file covering everything* -- not one file per project
+/// -- which is why `write_consolidated_memory_file`'s gather step
+/// (`list_all_projects_and_global`) aggregates every project's memories
+/// into it rather than reading only the global scope. Revisit if a future
+/// slice adds real per-project ambient scoping (e.g. one `MEMORY.md` per
+/// project instead of one combined document).
 fn memory_md_target_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(crate::storage::jcode_dir()?.join("MEMORY.md"))
 }
 
-/// The actual per-cycle trigger: render the current global memory set into
-/// `MEMORY.md`, if enabled. Mirrors `memory_consolidation::
+/// The actual per-cycle trigger: render the current memory set (global plus
+/// every known project) into `MEMORY.md`, if enabled. Mirrors
+/// `memory_consolidation::
 /// run_one_ambient_extraction`'s own shape (an `is_*_enabled` gate,
 /// `Ok(())`/no-op when disabled) so the two triggers read the same way at
 /// their one call site in `ambient/runner.rs`.

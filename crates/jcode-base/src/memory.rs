@@ -1167,6 +1167,54 @@ impl MemoryManager {
         Ok(all)
     }
 
+    /// Aggregate view across the global graph plus *every* known project
+    /// graph on disk -- not just whatever single project (if any) this
+    /// manager happens to be scoped to. For a document meant to summarize
+    /// everything the user has (`MEMORY.md` consolidation), not a
+    /// per-project view.
+    ///
+    /// **Real bug fix, caught by a full-repo review**: `memory_consolidator`
+    /// used to call plain `list_all()` on a `MemoryManager::new()` (no
+    /// `project_dir`), which only ever reads the global-scope graph --
+    /// while extraction (`memory_consolidation::extract_claimed_session`)
+    /// stores into *project* scope via `remember_project` whenever a
+    /// session has a `working_dir` (the common case). `MEMORY.md` silently
+    /// never reflected any project-scoped memory as a result. This gathers
+    /// the global graph plus every `~/.jcode/memory/projects/*.json` file
+    /// directly, ignoring `self.project_dir` entirely (unlike every other
+    /// method on this type) -- there is no single "current project" for a
+    /// document meant to cover all of them.
+    ///
+    /// In test mode, delegates to [`Self::list_all`] instead of scanning a
+    /// real `projects/` directory -- matching every other `MemoryManager`
+    /// method's test-isolated behavior (test mode already redirects project
+    /// storage to one fixed `test_project.json`, so there is no real
+    /// multi-project directory to scan in the first place).
+    pub fn list_all_projects_and_global(&self) -> Result<Vec<MemoryEntry>> {
+        if self.test_mode {
+            return self.list_all();
+        }
+
+        let mut all: Vec<MemoryEntry> =
+            self.load_global_graph()?.all_memories().cloned().collect();
+
+        let projects_dir = storage::jcode_dir()?.join("memory").join("projects");
+        if let Ok(read_dir) = std::fs::read_dir(&projects_dir) {
+            for dir_entry in read_dir.flatten() {
+                let path = dir_entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(graph) = storage::read_json::<MemoryGraph>(&path) {
+                    all.extend(graph.all_memories().cloned());
+                }
+            }
+        }
+
+        all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(all)
+    }
+
     pub fn forget(&self, id: &str) -> Result<bool> {
         // Try graph-based removal first (new format)
         let mut project_graph = self.load_project_graph()?;
@@ -1856,13 +1904,32 @@ impl MemoryManager {
         }
     }
 
-    /// Save project memories as a MemoryGraph
+    /// Save project memories as a MemoryGraph.
+    ///
+    /// **Real bug fix, caught by a full-repo review**: this used to silently
+    /// no-op (`Ok(())`, no write, no error) whenever `project_memory_path()`
+    /// returned `None` -- i.e. whenever this manager has no `project_dir`
+    /// set. Every write path that goes through here (`remember_project`,
+    /// `upsert_project_memory`, ...) calls this with `?`, so callers already
+    /// treat a returned error as "the write didn't happen, handle that" --
+    /// the silent no-op just meant a write that looked exactly like success
+    /// actually discarded the memory with no error surfaced anywhere.
+    /// Erroring instead makes that failure visible at the one place it can
+    /// actually be diagnosed. Every other call site in this file already
+    /// only reaches `save_project_graph` after confirming `project_dir` is
+    /// set (either directly, or because the project graph it loaded was
+    /// necessarily non-empty, which is only possible with a real
+    /// `project_dir`) -- verified against every call site in this module
+    /// before making this change, not assumed safe.
     pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
-        if let Some(path) = self.project_memory_path()? {
-            storage::write_json(&path, graph)?;
-            if !self.test_mode {
-                cache_graph(path, graph);
-            }
+        let Some(path) = self.project_memory_path()? else {
+            anyhow::bail!(
+                "cannot save project-scoped memories: this MemoryManager has no project_dir set"
+            );
+        };
+        storage::write_json(&path, graph)?;
+        if !self.test_mode {
+            cache_graph(path, graph);
         }
         Ok(())
     }

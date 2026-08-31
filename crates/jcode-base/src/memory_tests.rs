@@ -636,6 +636,68 @@ fn project_memories_are_isolated_by_explicit_project_dir() {
     });
 }
 
+/// Regression for a real bug a full-repo review caught: `save_project_graph`
+/// used to silently no-op (`Ok(())`, no write, no error) when this manager
+/// has no `project_dir` set -- meaning `remember_project` on a project-dir-
+/// less manager looked exactly like success while discarding the memory
+/// entirely, with no error surfaced anywhere.
+#[test]
+fn remember_project_without_a_project_dir_fails_loudly_instead_of_discarding_silently() {
+    with_temp_home(|_home| {
+        let manager = MemoryManager::new();
+        assert!(manager.get_project_dir().is_none());
+
+        let result = manager.remember_project(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "should not vanish silently",
+        ));
+        assert!(
+            result.is_err(),
+            "must surface an error instead of silently discarding the memory"
+        );
+    });
+}
+
+/// Regression for the periodic MEMORY.md trigger's real bug: extraction
+/// stores into project scope (`remember_project`) whenever a session has a
+/// working dir, while `run_memory_md_consolidation` builds a project-dir-
+/// less manager -- so a plain `list_all()` on that manager would never see
+/// any project's memories. `list_all_projects_and_global` must aggregate
+/// across every known project plus the global graph regardless of which
+/// project (if any) the manager it's called on is scoped to.
+#[test]
+fn list_all_projects_and_global_aggregates_every_project_plus_global() {
+    with_temp_home(|_home| {
+        let project_a = MemoryManager::new().with_project_dir("/tmp/jcode-aggregate-a");
+        let project_b = MemoryManager::new().with_project_dir("/tmp/jcode-aggregate-b");
+        let global = MemoryManager::new();
+
+        project_a
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "fact from project a"))
+            .expect("remember project a");
+        project_b
+            .remember_project(MemoryEntry::new(MemoryCategory::Fact, "fact from project b"))
+            .expect("remember project b");
+        global
+            .remember_global(MemoryEntry::new(MemoryCategory::Fact, "a global fact"))
+            .expect("remember global");
+
+        // Queried from a manager scoped to neither project -- exactly how
+        // `run_memory_md_consolidation` constructs it.
+        let renderer = MemoryManager::new();
+        let contents: Vec<String> = renderer
+            .list_all_projects_and_global()
+            .expect("aggregate")
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect();
+
+        assert!(contents.iter().any(|c| c == "fact from project a"));
+        assert!(contents.iter().any(|c| c == "fact from project b"));
+        assert!(contents.iter().any(|c| c == "a global fact"));
+    });
+}
+
 #[test]
 fn manager_search_scoped_normalizes_whitespace_and_separators() {
     with_temp_home(|_home| {
