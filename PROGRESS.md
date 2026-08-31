@@ -605,6 +605,10 @@ At the user's insistence to keep finding real angles, went past reading third-pa
 
 **Where this leaves the investigation, honestly**: every concrete, testable client-side lead across three separate passes tonight (header presence/content, a legitimate alternate product identity, a different real hostname+endpoint from agy's own logs) has now been tested against the live API and come back negative, each for a different, specific, verified reason -- not assumption piled on assumption. The remaining open thread (that second OAuth client id, and what token-minting flow it belongs to) is real but not something resolvable from static analysis of a compiled binary alone.
 
+## Session paused here (2026-08-31): one final test settled the Antigravity investigation
+
+The user's own untouched `~/Downloads/jcode-macos-aarch64` -- `v0.64.2`, downloaded a full month before this session, code unchanged since -- was tested live and got the identical `429` right now. That's the cleanest evidence the whole investigation produced: the exact same code that genuinely worked before fails today, so this was never a jcode-fusion (or any jcode version's) code problem -- something changed on the account or Google's backend side. The user chose to pause this fork and use plain upstream jcode for now, having confirmed directly (not just been told) that vanilla jcode carries the identical code and won't behave differently. See `claude-code-build/PROJECT_FINAL_SUMMARY.md` for the single-file pickup point covering everything shipped and everything found. Nothing is lost -- every commit is pushed and verified on `tirthfx/jcode-fusion`.
+
 ## Next steps (pick up here)
 
 1. **Phase 3, orchestration-as-script**: `save`/`list`/`run` are wired and tested, but `run`'s actual `Request::CommSeedGraph` round trip has never been exercised against a live daemon (same category of gap as every other slice's "no live-credentialed run yet" note) — worth covering once a live verification session happens. No Starlark scripting inside a template yet (reuse the existing dependency, don't add `rhai` — see above). No template versioning/migration story if the shape changes again.
