@@ -583,7 +583,7 @@ New regression test asserting the URL contains `select_account` in its prompt li
 
 ## Antigravity 429: a second account hit the identical error on its first-ever request -- real evidence the gate isn't per-account at all (2026-08-31)
 
-After the `select_account` OAuth fix above, the user logged into a genuinely different, freshly-added second Google account (`hiteshborkar48@gmail.com`, project `xenon-bliss-87c1c`, confirmed distinct from account 1's `pioneering-xyston-kj013`). jcode's own post-login validation immediately smoke-tested it with a real `generateContent` call -- and got the identical `429 RESOURCE_EXHAUSTED`, on an account's very first-ever request to this API.
+After the `select_account` OAuth fix above, the user logged into a genuinely different, freshly-added second Google account (`account-2@example.com`, project `gcp-project-b`, confirmed distinct from account 1's `gcp-project-a`). jcode's own post-login validation immediately smoke-tested it with a real `generateContent` call -- and got the identical `429 RESOURCE_EXHAUSTED`, on an account's very first-ever request to this API.
 
 **This is a real, important update to the working model, not just another negative result.** A brand-new account hitting the same wall on request #1 rules out a purely per-account quota explanation -- if it were account-specific, a never-before-used account should have full headroom. The gate has to be something *shared* across both accounts' requests.
 
@@ -591,7 +591,7 @@ After the `select_account` OAuth fix above, the user logged into a genuinely dif
 
 **Consequence, taken seriously**: further live testing right now, on either account, risks worsening whatever short-term rate window this is, not diagnosing it further. Stopped active probing for the rest of this session as a result. If this hypothesis is right, the real signal to watch for is whether the SAME accounts succeed again after a genuine cooldown (the model catalog's own `resets in ~4-5h` windows, observed earlier tonight) with request volume kept deliberately low -- not immediately re-testing.
 
-**Both real Google accounts' credentials backed up** (read-only copies, not the active slot) at `~/.jcode/antigravity_oauth_account1_tshendage61.json` and `~/.jcode/antigravity_oauth_account2_hiteshborkar48.json`, for manual swapping into the single active `~/.jcode/antigravity_oauth.json` slot later, per the user's own chosen "manual fallback, no new rotation code" scope from earlier tonight.
+**Both real Google accounts' credentials backed up** (read-only copies, not the active slot) at `~/.jcode/antigravity_oauth_account1.json` and `~/.jcode/antigravity_oauth_account2.json`, for manual swapping into the single active `~/.jcode/antigravity_oauth.json` slot later, per the user's own chosen "manual fallback, no new rotation code" scope from earlier tonight.
 
 ## Antigravity 429: checked the real, live `agy` binary and its own request logs directly -- two more concrete, tested leads, both real negative results (2026-08-31)
 

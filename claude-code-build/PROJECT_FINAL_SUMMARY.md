@@ -49,7 +49,7 @@ This consumed a large fraction of the second session and deserves an honest, com
 
 - **GitHub**: `tirthfx/jcode-fusion`, branch `main`, fully up to date, every commit pushed and verified (`git branch -vv` shows `[origin/main]`, no "ahead").
 - **PR #1** (`fix/antigravity-429-client-identity`): merged. Adds retry/backoff and a clearer error message for the 429 — genuinely useful resilience, does not and cannot fix the underlying cause per the investigation above.
-- **Two working Google accounts** for Antigravity, both currently blocked identically: credentials backed up read-only at `~/.jcode/antigravity_oauth_account1_tshendage61.json` and `~/.jcode/antigravity_oauth_account2_hiteshborkar48.json` (these survive the jcode-fusion deletion — they're outside the repo, in `~/.jcode`).
+- **Two working Google accounts** for Antigravity, both currently blocked identically: credentials backed up read-only at `~/.jcode/antigravity_oauth_account1.json` and `~/.jcode/antigravity_oauth_account2.json` (these survive the jcode-fusion deletion — they're outside the repo, in `~/.jcode`).
 - **Working provider right now**: `claude` (real Anthropic OAuth) — confirmed multiple times tonight with genuine successful completions.
 
 ## Picking this back up later
