@@ -24,15 +24,21 @@ Full rationale for every decision — including what was rejected and why — li
 
 ## What shipped
 
-| Phase | Feature | What it does |
-|---|---|---|
-| **0 — Foundation** | **Mission Engine** | Budget-aware state machine (token/wall-clock accounting, auto-continuation) + a rule that an agent can never grade its own "done" — a separate verifier must confirm completion. Plus per-turn rewind checkpoints that refuse to guess rather than reconstruct unsafely. |
-| **1 — Safety** | **Guardian, sandboxing, execpolicy** | Whole-process macOS Seatbelt sandboxing. An LLM-as-judge ("Guardian") auto-adjudicating sandbox-escalation requests, fails closed. Starlark-based command classification replacing regex allowlists. |
-| **2 — Swarm rework** | **Worktree-per-subagent isolation** | Every spawned agent gets its own git worktree; conflicts resolve via plain `git merge` instead of mid-edit negotiation. A real `apply` action merges a worker's commits back into the coordinator's tree. |
-| **3 — Ecosystem** | **Workflows + full ACP** | Orchestration-as-script (`workflow` tool: saved, replayable, parameterized multi-agent task graphs). Full Agent Client Protocol support — session lifecycle, session-scoped MCP servers, bidirectional client callbacks. |
-| **4 — Memory** | **Two-phase consolidation** | Leased/claimed background extraction jobs per session (with retry backoff), then a locked-write consolidator rendering a global `MEMORY.md`. |
+Nine features, ported from two donor harnesses across five phases — each reimplemented in idiomatic jcode-style Rust, never copy-pasted (jcode is MIT, both donors are Apache-2.0):
 
-Every phase is complete per the original `DESIGN.md` scope.
+| Phase | Feature | Source | What it does |
+|---|---|---|---|
+| **0 — Foundation** | Mission Engine | Codex Harness + Grok Build | Budget-aware state machine (token/wall-clock accounting, auto-continuation) + a rule that an agent can never grade its own "done" — a separate verifier must confirm completion. |
+| **0 — Foundation** | Provable-safe rewind | Grok Build | Rewind checkpoints that refuse to guess rather than reconstruct unsafely after compaction. |
+| **1 — Safety** | Guardian | Codex Harness | LLM-as-judge auto-adjudicating sandbox-escalation requests — deny-only, fails closed. |
+| **1 — Safety** | Layered OS sandboxing | Codex Harness | Whole-process macOS Seatbelt sandboxing (re-execs the entire binary, not just subprocess calls). |
+| **1 — Safety** | Execpolicy-as-Starlark | Codex Harness | Starlark-based command classification layered on top of jcode's existing risk classifier, never downgrading it. |
+| **2 — Swarm rework** | Worktree-per-subagent isolation | Codex Harness + Grok Build (convergent) | Every spawned agent gets its own git worktree; conflicts resolve via plain `git merge` instead of mid-edit negotiation. A real `apply` action merges a worker's commits back into the coordinator's tree. |
+| **3 — Ecosystem** | Full Agent Client Protocol | Grok Build | Session lifecycle, session-scoped MCP servers, bidirectional client callbacks over ACP. |
+| **3 — Ecosystem** | Orchestration-as-script | Grok Build | `workflow` tool: saved, replayable, parameterized multi-agent task graphs. |
+| **4 — Memory** | Two-phase consolidation | Codex Harness | Leased/claimed background extraction jobs per session (with retry backoff), then a locked-write consolidator rendering a global `MEMORY.md`. |
+
+Every phase is complete per the original `DESIGN.md` scope. The full per-feature rationale — including convergent cases like worktree isolation, where both donors independently arrived at the same idea — is in `DESIGN.md` §6.
 
 **Quality process**: two full-repo AI code scans surfaced 54 findings, every one triaged — fixed, confirmed pre-existing, or deliberately deferred, never rubber-stamped. Real bugs caught before shipping: a cross-session ACP callback forgery, a lock-contention leak, a permanent-data-loss regression in memory consolidation, and others. The recurring lesson: **review the fix, not just the original bug** — several "fixed" issues had a second, subtler bug hiding inside the fix itself, caught only by a follow-up adversarial pass.
 
@@ -55,7 +61,7 @@ Picking this back up: `git clone` this repo and read the build docs above in ord
 ## Credits
 
 - [`1jehuang/jcode`](https://github.com/1jehuang/jcode) — the base harness this fork builds on. MIT license.
-- [`openai/codex`](https://github.com/openai/codex) (Codex Harness) — source of the Mission Engine, Guardian, and sandboxing patterns. Apache-2.0.
-- [`xai-org/grok-build`](https://github.com/xai-org/grok-build) — source of the adversarial-verification, worktree-isolation, and ACP patterns. Apache-2.0.
+- [`openai/codex`](https://github.com/openai/codex) (Codex Harness) — source of the Guardian, layered OS sandboxing, execpolicy-as-Starlark, two-phase memory consolidation, and (jointly with Grok Build) Mission Engine and worktree-per-subagent isolation. Apache-2.0.
+- [`xai-org/grok-build`](https://github.com/xai-org/grok-build) — source of provable-safe rewind, full ACP support, orchestration-as-script, and (jointly with Codex Harness) Mission Engine and worktree-per-subagent isolation. Apache-2.0.
 
 This is an independently maintained fork, not an upstream contribution — jcode's `CONTRIBUTING.md` discourages large external PRs, so this project is planned and resourced as a hard fork from day one.
