@@ -291,6 +291,11 @@ pub fn maybe_reexec_under_sandbox() {
 /// to fail and silently fall back to the fail-open unsandboxed path.
 const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
+// Gated like `SANDBOX_EXEC_PATH` above and its only caller,
+// `maybe_reexec_under_sandbox`: without this, the function was compiled on
+// every platform but referenced a macOS-only constant, so the crate failed
+// to build on Linux/Windows (E0425).
+#[cfg(target_os = "macos")]
 fn try_reexec_under_sandbox() -> anyhow::Result<()> {
     let profile = build_seatbelt_profile(&resolve_default_protected_paths());
     let current_exe = std::env::current_exe()?;
